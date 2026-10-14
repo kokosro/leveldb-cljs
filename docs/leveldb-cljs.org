@@ -1,0 +1,1066 @@
+#+TITLE: leveldb-cljs Manual
+#+SUBTITLE: A ClojureScript (Node.js) client for LevelDB through =level= (classic-level / abstract-level 3) — codecs, batches, sublevels, core.async iterators and events
+#+DATE: 2026-09-25
+#+OPTIONS: toc:2 num:t ^:nil
+#+LANGUAGE: en
+
+* Introduction
+
+through the =level= npm package: =level@10= re-exports =classic-level@3=, the Node-API
+binding of LevelDB 1.20 that implements the =abstract-level@3= interface. LevelDB is a
+lexicographically sorted, single-process, on-disk key-value store with atomic batches and
+snapshot-isolated iterators; =abstract-level= adds encodings, sublevels (key namespaces),
+explicit snapshots and an event surface. The library covers all of it as plain
+ClojureScript:
+
+- *Clients* — =open!= resolves to an already-open client for an on-disk database or for
+  the in-process =memory-level= backend (tests), =close!= / =open!= again, =status=,
+  =supports=, and a resource census (=open-resources=).
+- *Codecs by keyword* — =:utf8= =:json= =:edn= =:hex= =:base64= =:buffer= =:view= =:raw=
+  (or a custom codec map) per client, per sublevel or per call, with a guard that turns
+  the silent =[object Object]= stringification of upstream into a =codec-error=.
+- *Operations* — =get!= =get-sync= =get-many!= =has!= =has-many!= =put!= =del!= =batch!=
+  =clear!=, chained batches, sublevels (nested, reopen-safe, root-checked), explicit
+  snapshots.
+- *Iterators as core.async channels* — =entries!= / =keys!= / =values!= with ranges,
+  reverse, limit, backpressure and close-to-cancel; =collect!=, =reduce!= and the =-seq!=
+  helpers for promises; the raw iterator handles (=it-next!= =it-nextv!= =it-seek!= …)
+  underneath.
+- *Events as a core.async channel* — =events!= delivers =:opening= =:open= =:closing=
+  =:closed= =:put= =:del= =:batch= =:clear= maps derived from the upstream =write= /
+  =clear= events, decoded with the client's codecs.
+
+It is meant to be consumed *as a source dependency* by another shadow-cljs Node app
+(namespace prefix =leveldb-cljs.*=) and follows the same house contract as
+=coinbase-cljs= and =openrouter-cljs=:
+
+- *Kebab-cased keyword maps in and out.* Options are kebab keywords, booleans may carry
+  the idiomatic =?= suffix (=:create-if-missing?=, =:keys-only?=), and they are translated
+  mechanically to the upstream camelCase (=keyEncoding=, =highWaterMarkBytes=). Unknown
+  option keys are an =argument-error= before any upstream call (upstream would silently
+  ignore them). The =supports= manifest comes back with every key kebab-cased.
+- *No JavaScript interop at call sites.* One namespace, =leveldb-cljs.core=, is the binding:
+  it is the only place that requires =level= / =memory-level=, calls methods on their
+  objects, builds JS option objects or reads a thrown JS error. =codec= calls only
+  =JSON.stringify= / =JSON.parse=; =iter= and =util= are pure ClojureScript. The public API
+  carries no =^js= hints and every handle (client, iterator, chained batch, snapshot) is
+  an opaque record that prints as a short summary.
+- *promesa promises for every I/O operation* (=promesa.core=): compose with =p/let=,
+  =p/->=, =p/all=, =p/catch=. The documented synchronous exceptions (=get-sync=,
+  =it-seek!=, =batch-put!= / =batch-del!= / =batch-clear!=, the constructors) return
+  values and throw.
+- *core.async only where a stream is the natural shape*: iterator channels and the
+  events channel.
+- *One runtime npm dependency: =level= itself.* =memory-level= is a devDependency used by
+  the tests and available to consumers who install it for =:memory? true=. The only
+  ClojureScript dependencies are =org.clojure/core.async= and =funcool/promesa=.
+- *Structured errors.* Every rejection and every synchronous throw is an =ex-info= with a
+  =:type= in =:leveldb-cljs/db-error= / =:leveldb-cljs/argument-error= /
+  =:leveldb-cljs/codec-error=; upstream =LEVEL_*= codes become =:code= keywords (see
+  [[Error handling]]).
+
+** The binding-namespace architecture
+
+The upstream API is a JavaScript class hierarchy with two error delivery mechanisms
+(synchronous throws from constructors and from the chained batch, promise rejections from
+everything else), encodings that silently stringify anything they do not understand,
+camelCase options that ignore typos, and handles (sublevels) that die when their parent
+closes. Confining all of that to one namespace is what makes the rest of the library
+ordinary ClojureScript:
+
+- =leveldb-cljs.util= — pure: kebab ⇄ camel translation, =LEVEL_*= code translation, the
+  three =ex-info= constructors and predicates, option normalisation and whitelists,
+  batch-op validation, and the one core.async helper shared by the iterator and event
+  channels (=put-or-cancel!=).
+- =leveldb-cljs.codec= — pure codec descriptors: a codec is a map
+  ={:name :format :upstream :encode :decode :check :expects}=; =encode= validates and
+  encodes into the store format *before* anything reaches upstream, =decode= runs on every
+  raw read.
+- =leveldb-cljs.core= — the binding *and* the client: lifecycle, reads, writes, batches,
+  sublevels, snapshots, iterator handles, the events channel, bytes helpers. Every
+  upstream call goes through one adapter (=run= / =run-sync=) that normalises both a
+  synchronous throw and a rejection into one =ex-info= taxonomy.
+- =leveldb-cljs.iter= — core.async over the iterator handles of =core=: no interop, no
+  upstream objects.
+
+Where this manual says "verified live" it refers to the phase-4 live smoke
+(=dev/leveldb_cljs/smoke.cljs=, 8/8 sections passing on 2026-09-25 against a real
+=classic-level= database in a temp directory on Linux x64 / Node 22.23.2 with the shipped
+prebuilt binary) and to the inventory's probes of the same day. The raw research behind
+the library — every upstream method, event, error code and pitfall with its evidence — is
+=docs/leveldb-api-inventory.org=; section numbers quoted as "inventory 9.13" point there.
+
+* Quick start
+
+** Requirements
+
+- Node.js 18+ (=classic-level= ships Node-API prebuilds built with =--napi= against Node 18
+  headers for =linux-x64= (glibc and musl), =linux-arm= / =arm64=, =darwin-x64+arm64=,
+  =win32-x64= / =ia32= and Android; anything else compiles from source through
+  =node-gyp-build= and needs Python plus a C++ toolchain — inventory 1.3). The repo is
+  developed and smoked on Node 22.
+- Java 11+ for shadow-cljs.
+- The =level= npm package in the consumer's =node_modules= (it is a *runtime* dependency of
+  the wrapped library, resolved by =js/require= at the first =open!=), and =memory-level=
+  if =:memory? true= is used.
+
+** Source dependency
+
+dependency. Its own =deps.edn= declares ClojureScript, core.async and promesa, so a
+consumer's =deps.edn= only needs:
+
+#+begin_src clojure
+        ;; or a local checkout while developing both sides:
+        }}
+#+end_src
+
+The consumer's =shadow-cljs.edn= uses =:deps true= so the classpath comes from =deps.edn=,
+and its =package.json= lists the npm side:
+
+#+begin_src bash
+npm install level            # runtime: classic-level + abstract-level, prebuilt binary
+npm install -D memory-level  # only if you open {:memory? true} databases (tests)
+#+end_src
+
+Then require the namespaces you need:
+
+#+begin_src clojure
+(ns my.app
+  (:require [cljs.core.async :as async :refer [<! go-loop]]
+            [leveldb-cljs.core :as db]
+            [leveldb-cljs.iter :as iter]
+            [leveldb-cljs.codec :as codec]
+            [leveldb-cljs.util :as util]
+            [promesa.core :as p]))
+#+end_src
+
+** First database
+
+=open!= takes a path string or an options map and resolves to an *open* client (the
+upstream =open()= is awaited, so a failed open rejects here, not on the first read):
+
+#+begin_src clojure
+(p/let [c (db/open! {:path "./data" :value-encoding :edn})
+        _ (db/put! c "alice" {:score 620 :tags #{:vip}})
+        v (db/get! c "alice")                     ; {:score 620 :tags #{:vip}}
+        missing (db/get! c "nobody")              ; nil — there is no not-found error
+        _ (db/batch! c [{:type :put :key "bob" :value {:score 10}}
+                        {:type :del :key "carol"}])
+        ks (db/keys! c {:gte "a" :lt "c"})        ; ["alice" "bob"]
+        _ (db/close! c)]
+  (println v missing ks))
+#+end_src
+
+** First channel
+
+Iterators are lazy, backpressured core.async channels; close the channel to stop early
+and the upstream iterator is released:
+
+#+begin_src clojure
+(let [ch (iter/entries! c {:gte "a" :lt "m" :batch-size 50})]
+  (go-loop []
+    (when-some [item (<! ch)]
+      (if (iter/error? item)
+        (println "iteration failed:" (ex-message item))
+        (println (:key item) (:value item)))
+      (recur))))
+
+;; or as a promise of a vector (pass :limit for large ranges)
+(p/let [entries (iter/entries-seq! c {:gte "a" :limit 100})]
+  (count entries))
+#+end_src
+
+** First events subscription
+
+#+begin_src clojure
+(let [ch (db/events! c {:only #{:put :del :batch}})]
+  (go-loop []
+    (when-some [{:keys [event key value ops]} (<! ch)]
+      (case event
+        :put   (println "put" key value)
+        :del   (println "del" key)
+        :batch (println "batch of" (count ops)))
+      (recur))))
+;; (db/close! c) delivers :closing / :closed and closes the channel
+#+end_src
+
+* Clients
+
+** =open!=
+
+#+begin_src clojure
+(db/open! "./data")                                   ; path string, utf8/utf8 codecs
+(db/open! {:path "./data"                             ; alias :location
+           :key-encoding :utf8                        ; codec keyword or codec map
+           :value-encoding :edn
+           :create-if-missing? true                   ; upstream default true
+           :error-if-exists? false
+           :compression true                          ; Snappy, upstream default true
+           :cache-size (* 8 1024 1024)                ; classic-level tuning options
+           :write-buffer-size nil                     ; nil options are dropped
+           :block-size nil :max-open-files nil :block-restart-interval nil
+           :max-file-size nil :multithreading nil :store-encoding nil})
+(db/open! {:memory? true :value-encoding :json})      ; memory-level, no disk
+(db/open! c)                                          ; reopen a closed client (idempotent when open)
+#+end_src
+
+The promise resolves to a =Client= record whose upstream handle is already =:open=, so
+chained batches (which upstream refuses while opening) always work. Open failures reject
+with =:code :database-not-open= plus a best-effort =:reason=: =:locked= (another process
+or instance holds the LevelDB =LOCK= file — the only cause with its own upstream code,
+=LEVEL_LOCKED=, surfaced as =:cause-code=), =:missing= (=:create-if-missing? false= on an
+absent directory), =:exists= (=:error-if-exists? true=), =:io=, or nil (inventory 3.4,
+9.4). The memory backend accepts but *ignores* =:create-if-missing?= / =:error-if-exists?=
+(its manifest lists both as false; verified with a probe). =:path= must be a string
+unless =:memory? true=; any option outside =db/open-options= is an =argument-error=.
+
+A *sublevel client* passed to =open!= reopens its root and gets a fresh upstream handle
+(see [[Sublevels]]).
+
+** =close!=, =status=, =open?=
+
+=close!= closes the root (with every sublevel, iterator, chained batch and snapshot) or,
+for a sublevel client, only that sublevel and its descendants. It is idempotent and
+resolves to nil. Afterwards every operation rejects with =:code :database-not-open=
+(=(db/not-open? e)=), constructors throw the same, and =status= reports =:closed=.
+=status= is synchronous and returns =:opening= / =:open= / =:closing= / =:closed= of the
+client's *current* upstream handle; =open?= is the =:open= test. Verified live: after
+=close!= a sublevel client's status is =:closed=, after =open!= of the root it reads again
+through a re-derived handle.
+
+** =supports=, =location=, =backend=, =open-resources=
+
+- =(db/supports c)= — the upstream =db.supports= manifest as a kebab map: =:implicit-snapshots=
+  =:explicit-snapshots= =:has= =:get-sync= =:events {:opening :open :closing :closed :write
+  :clear}= =:encodings {:utf8 :json :buffer :view ...}= =:additional-methods {...}= etc.
+  Consult it before =snapshot= (=:explicit-snapshots=) on unknown backends.
+- =(db/location c)= — the directory of the root database, nil for memory.
+- =(db/backend c)= — =:level= or =:memory=.
+- =(db/open-resources c)= — ={:iterators n :snapshots n :batches n :subscriptions n}=
+  counting the handles created through this root that were not closed / released yet.
+  The tests and the smoke use it to prove that a cancelled channel released its upstream
+  iterator and that a closed events channel removed its listeners.
+- =(db/key-encoding c)= / =(db/value-encoding c)= — ={:name :format :upstream}= of the
+  client's default codecs.
+
+** Codec selection
+
+Codecs are chosen at three levels, most specific wins: a per-call =:key-encoding= /
+=:value-encoding= option, the client's own codecs (a sublevel inherits its parent's unless
+told otherwise — unlike upstream, which resets sublevels to utf8), then =:utf8=. Batch ops
+add a fourth: an op-level encoding beats the op's =:sublevel= codecs, which beat the
+batch-level option, which beats the client's ([[Batches]]).
+
+** Handles print safely
+
+Clients, iterators, batches and snapshots hold upstream objects with cycles;
+=pr-str= prints a summary instead of walking them:
+=#leveldb-cljs/client{:kind :root, :name nil, :key-encoding :utf8, :value-encoding :edn}=.
+=client?=, =root?=, =root= and =parent= navigate the client tree.
+
+* Codecs
+
+A codec turns a ClojureScript key or value into the *store format* upstream accepts
+(=:utf8= text, or opaque bytes as =:buffer= / =:view=) and back. =leveldb-cljs.core=
+encodes every key, value and range bound with =codec/encode= before calling upstream and
+decodes every raw read with =codec/decode=, so upstream only ever sees its own =utf8= /
+=buffer= / =view= (and =hex= / =base64=) encodings and can never stringify a ClojureScript
+value silently (inventory pitfall 8.4).
+
+** Builtin codecs
+
+| keyword   | store format | upstream name | ClojureScript side                                                                           |
+|-----------+--------------+---------------+----------------------------------------------------------------------------------------------|
+| =:utf8=   | =:utf8=      | =utf8=        | string in, string out — the default; anything else is a =codec-error=                        |
+| =:json=   | =:utf8=      | =utf8=        | data ⇒ =JSON.stringify (clj->js v)= ⇒ text; text ⇒ =js->clj= with keywordized map keys. Lossy for keywords, symbols, sets, non-string map keys (all become strings); a value with no JSON representation (=js/undefined=, a function) is a =codec-error= |
+| =:edn=    | =:utf8=      | =utf8=        | =pr-str= in, =cljs.reader/read-string= out: exact round-trip of EDN data (keywords, sets, symbols, nested maps, nil inside collections). Recommended for CLJS values |
+| =:hex=    | =:buffer=    | =hex=         | an even-length hex string in and out; the *bytes* are stored (=(db/get! c k {:value-encoding :raw})= reads them back as bytes) |
+| =:base64= | =:buffer=    | =base64=      | a base64 string (valid alphabet and padding) in and out; bytes stored                        |
+| =:buffer= | =:buffer=    | =buffer=      | opaque bytes (Buffer / Uint8Array) in, Buffer out                                            |
+| =:view=   | =:view=      | =view=        | opaque bytes in, Uint8Array out                                                              |
+| =:raw=    | =:buffer=    | =buffer=      | a string (stored as its utf8 bytes) or bytes go through untouched; reads yield the stored bytes — read what another codec wrote, byte for byte |
+
+=(codec/names)= lists them; =(codec/resolve :edn)= returns the resolved map; =(codec/describe
+codec)= is its ={:name :format :upstream}= summary. The EDN codec accepts options for tagged
+literals: =(codec/edn-codec {:readers {'my/tag f} :default (fn [tag v] ...)})=.
+
+** The silent-stringify guard
+
+Upstream's =utf8= encoding calls =String(value)= on anything that is not a string or
+bytes, so a JavaScript caller who puts an object gets ="[object Object]"= in the store
+without a warning. Every codec here carries a =:check= predicate (=:expects= describes it)
+that =codec/check-value!= runs *before* upstream is called:
+
+#+begin_src clojure
+(p/catch (db/put! c "k" {:a 1})                       ; client codec :utf8
+         (fn [e]
+           (util/error-type e)                        ; :leveldb-cljs/codec-error
+           (ex-message e)))                           ; "leveldb-cljs codec: cannot encode value with codec :utf8: expected a string, got {:a 1}"
+;; ex-data: {:type :leveldb-cljs/codec-error :codec :utf8 :direction :encode :role :value :value {:a 1}}
+#+end_src
+
+The guard applies to keys, values and range bounds alike (=:role= says which). A =nil= key
+or value is an =argument-error= (upstream would answer =LEVEL_INVALID_KEY= /
+=LEVEL_INVALID_VALUE=). Verified live: smoke section 7.
+
+** Per-call overrides
+
+Every read and write accepts =:key-encoding= / =:value-encoding= for that call only:
+
+#+begin_src clojure
+(p/let [_ (db/put! c "j" {:n 1} {:value-encoding :json})
+        _ (db/put! c "h" "cafe00" {:value-encoding :hex})
+        j (db/get! c "j" {:value-encoding :json})    ; {:n 1}
+        h (db/get! c "h" {:value-encoding :hex})     ; "cafe00"
+        b (db/get! c "h" {:value-encoding :raw})]    ; the 3 stored bytes
+  (db/bytes->hex b))                                 ; "cafe00"
+#+end_src
+
+The store keeps no record of which codec wrote a value: reading with a different codec
+decodes whatever bytes are there (=:utf8= reads the JSON text of a =:json= write; =:edn=
+reading non-EDN text raises a =codec-error= with =:direction :decode= and =:cause=).
+Iterators and =clear!= encode their =:gt= / =:gte= / =:lt= / =:lte= bounds with the
+*key* codec in force, so a =:json= key codec sorts by JSON text, not by number (inventory
+4.5: keys sort by encoded bytes, ="10" < "9"=).
+
+** Sublevel inheritance
+
+=(db/sublevel c "people")= inherits the parent's key and value codecs;
+=(db/sublevel c "people" {:value-encoding :json})= overrides one. Reading a sublevel's
+entries through the *root* yields prefixed keys and the raw stored text (the root's codecs
+apply): with an =:edn= sublevel under a =:utf8= root, =(db/get! root "!people!alice")= is
+the EDN string (verified live, smoke section 2).
+
+** Custom codecs
+
+A codec map with =:format= (=:utf8= / =:buffer= / =:view=), =:encode=, =:decode= and
+optionally =:name=, =:check=, =:expects=; =encode= must return a value of the store
+format:
+
+#+begin_src clojure
+(def transit-like
+  {:name :upper :format :utf8
+   :check string? :expects "a string"
+   :encode clojure.string/upper-case
+   :decode clojure.string/lower-case})
+
+(db/open! {:memory? true :value-encoding transit-like})
+#+end_src
+
+Bytes without interop: =db/bytes?= =bytes->hex= =hex->bytes= =bytes->base64=
+=base64->bytes= =bytes->utf8= =utf8->bytes= =bytes-length= =bytes== (inventory 9.14) build
+and inspect the opaque values of the =:buffer= / =:view= / =:raw= codecs.
+
+* Basic operations
+
+Every operation takes the client first, then the key (and value), then an optional
+options map; every one returns a promesa promise except =get-sync=. Options outside the
+per-operation whitelist (=db/read-options=, =db/put-options=, …) are an =argument-error=.
+
+| fn                                | resolves to                                                    | options                                                     |
+|-----------------------------------+----------------------------------------------------------------+-------------------------------------------------------------|
+| =(get! c key & [opts])=           | the decoded value, or *nil* when the key is absent             | =:key-encoding :value-encoding :snapshot :fill-cache=       |
+| =(get-sync c key & [opts])=       | same, *synchronously* (returns / throws)                       | same                                                        |
+| =(get-many! c keys & [opts])=     | a vector of values, nil at the absent positions                | same                                                        |
+| =(has! c key & [opts])=           | true / false                                                   | =:key-encoding :snapshot=                                   |
+| =(has-many! c keys & [opts])=     | a vector of booleans                                           | same                                                        |
+| =(put! c key value & [opts])=     | nil                                                            | =:key-encoding :value-encoding :sync=                       |
+| =(del! c key & [opts])=           | nil — deleting an absent key is not an error                   | =:key-encoding :sync=                                       |
+| =(batch! c ops & [opts])=         | nil — atomic ([[Batches]])                                     | =:key-encoding :value-encoding :sync=                       |
+| =(clear! c & [opts])=             | nil — *not atomic* ([[=clear!= and persistence]])              | =:gt :gte :lt :lte :reverse :limit :key-encoding :snapshot= |
+
+** Not found is nil
+
+=level@10= has no =NotFoundError=: =get= resolves =undefined= for an absent key, which the
+library maps to =nil= (=get-many!= puts nil at that position). A nil value therefore means
+"absent"; a value that must be distinguishable from absence needs a codec that can
+represent it (=:edn= stores =nil= *inside* a collection fine but a bare nil value is an
+=argument-error=). Use =has!= when the question is existence.
+
+#+begin_src clojure
+(p/let [v (db/get! c "nobody")            ; nil
+        h (db/has! c "nobody")            ; false
+        vs (db/get-many! c ["a" "nobody" "b"])   ; ["1" nil "2"]
+        _ (db/del! c "nobody")]           ; resolves nil, no error
+  ...)
+#+end_src
+
+** =get-sync= blocks the event loop
+
+=get-sync= calls upstream =getSync= (classic-level 3, inventory 9.15), which reads on the
+calling thread: nothing else runs in the Node process until it returns. It is measurably
+faster than =get!= for small hot reads (no threadpool round trip) and is the right tool
+inside a tight synchronous computation; it is the wrong tool in a request path that must
+stay responsive. Errors are thrown, normalised to the same taxonomy:
+
+#+begin_src clojure
+(try
+  (db/get-sync c "hot-key" {:value-encoding :edn})
+  (catch :default e
+    (when (db/not-open? e) ...)))
+#+end_src
+
+** =:sync= and =:fill-cache=
+
+=:sync true= on =put!= / =del!= / =batch!= / =batch-write!= asks classic-level to =fsync=
+before resolving (durability against power loss; slower). =:fill-cache false= on reads and
+iterators keeps a one-off scan from evicting the block cache (classic-level only; memory
+ignores it).
+
+** Snapshots
+
+=(db/snapshot c)= returns a handle (synchronous; =:code :not-supported= where
+=(:explicit-snapshots (db/supports c))= is false). Pass it as =:snapshot= to =get!= /
+=get-many!= / =has!= / =has-many!= / iterators / =clear!= to read one consistent state;
+close it with =close-snapshot!= or let =with-snapshot!= do it:
+
+#+begin_src clojure
+(db/with-snapshot! c
+  (fn [s]
+    (p/let [_ (db/put! c "k" "after")            ; invisible to reads through s
+            before (db/get! c "k" {:snapshot s})
+            ks (db/keys! c {:snapshot s :gte "a"})]
+      [before ks])))
+#+end_src
+
+Iterators take an implicit snapshot at construction (=:implicit-snapshots= in the
+manifest); unclosed iterators and snapshots pin old versions and keep compaction from
+reclaiming them (inventory 5.3), which is why every channel and helper closes for you and
+=open-resources= exists.
+
+* Batches
+
+** Array batches
+
+=batch!= applies a vector of op maps atomically: either every op is written or none is.
+
+#+begin_src clojure
+(db/batch! c [{:type :put :key "b1" :value "one"}
+              {:type :put :key "b2" :value "two"}
+              {:type :del :key "b1"}                                   ; later op wins: b1 ends up absent
+              {:type :put :key "j" :value {:n 1} :value-encoding :json} ; per-op codec
+              {:type :put :key "alice" :value {:age 30} :sublevel people}] ; routed to a sublevel
+          {:sync false})
+#+end_src
+
+Each op is validated *and encoded* before upstream is called (=util/normalize-op=): =:type=
+must be =:put= or =:del=, =:key= must be present, a =:put= needs a =:value=, and only
+=:type :key :value :key-encoding :value-encoding :sublevel= are allowed — a malformed op
+is an =argument-error= naming its index and nothing is written. A batch-level
+=:key-encoding= / =:value-encoding= sets the default for every op.
+
+** Chained batches
+
+A chained batch queues ops synchronously (no main-thread copy of a big array) and commits
+them atomically on =batch-write!=. The client must be open — always true for a client from
+=open!=:
+
+#+begin_src clojure
+(p/let [b (db/chained-batch c)                 ; synchronous constructor
+        _ (-> b
+              (db/batch-put! "c1" "chained")
+              (db/batch-put! "bob" {:age 41} {:sublevel people})
+              (db/batch-del! "b2" {:key-encoding :utf8}))
+        n (db/batch-length b)                  ; 3
+        _ (db/batch-write! b {:sync false})]   ; commits and closes the batch
+  (db/batch-put! b "x" "y"))                    ; throws :code :batch-not-open
+#+end_src
+
+=batch-put!= / =batch-del!= / =batch-clear!= are synchronous, return the batch for
+threading and throw normalised errors (argument / codec errors before upstream,
+=:batch-not-open= after =batch-write!= or =batch-close!=). =batch-close!= discards a batch
+without writing. =with-batch!= is the safe form: it creates the batch, calls your function
+(which may return a promise), writes on success and closes on any error, rethrowing it:
+
+#+begin_src clojure
+(db/with-batch! c
+  (fn [b]
+    (doseq [[k v] pairs] (db/batch-put! b k v))))   ; resolves nil after the atomic write
+#+end_src
+
+** Sublevel ops and root validation
+
+An op with =:sublevel s= is prefixed and encoded for =s= (its codecs apply unless the op
+overrides them), so one batch can update several namespaces atomically. Upstream does not
+check that the sublevel belongs to the same database: a sublevel of *another* root is
+silently written into the wrong database or lost (inventory 9.2). =leveldb-cljs= checks
+root identity on every op and on =batch-put!= / =batch-del!= and rejects a foreign
+sublevel with an =argument-error= before anything is written (verified live, smoke
+section 4). A root client as =:sublevel= is likewise an =argument-error=.
+
+* Sublevels
+
+A sublevel is a key namespace: =(db/sublevel c "people")= returns a client whose keys are
+stored under the prefix =!people!= (separator =!= on both sides; =:separator= changes it).
+Sublevels nest — =(db/sublevel people "emails")= stores under =!people!!emails!= — and a
+vector name =(db/sublevel c ["people" "emails"])= creates the nested prefix with =c= as the
+direct parent. Names must be printable ASCII above ="= (upstream =LEVEL_INVALID_PREFIX=,
+surfaced as =:code :invalid-prefix=); the constructor is synchronous and throws.
+
+#+begin_src clojure
+(let [people (db/sublevel c "people" {:value-encoding :edn})
+      inner (db/sublevel people "inner")]
+  (p/let [_ (db/put! people "alice" {:age 30})
+          _ (db/put! inner "k" "v")
+          own (db/keys! people)                  ; ["!inner!k" "alice"] — a parent sees its descendants' prefixed keys
+          raw (db/get! c "!people!alice")]       ; "{:age 30}" — the root reads the stored EDN text
+    [(db/prefix people) (db/path inner) (db/parent inner) (db/root inner)]))
+;; ["!people!" ["people" "inner"] people c]
+#+end_src
+
+- *Isolation.* Iterating a sublevel is bounded to its prefix; =clear!= on a sublevel
+  clears only it; two sublevels can hold the same key.
+- *Codecs are inherited from the parent* (upstream resets them to utf8; inventory pitfall
+  8.9).
+- *Reopen re-derivation.* Upstream sublevel handles stay =closed= forever once their
+  parent closed (inventory 9.13). A =leveldb-cljs= sublevel client keeps its identity
+  across =close!= + =open!= of the root: the upstream handle is re-derived lazily when the
+  root's open generation moved, so the same =people= value reads again after a reopen
+  (verified live, smoke section 4). Reopening through the sublevel itself,
+  =(db/open! people)=, reopens the root.
+- *Cross-root rejection* in batch ops, above.
+- *The root sees everything.* A range scan on the root returns every sublevel's entries
+  with prefixed keys and raw values; bound a root scan with =:gte "!people!" :lt
+  "!people\""= (=\"= is the character after =!=) to select one sublevel's range without
+  its client, or simply iterate the sublevel client.
+
+* Iterators
+
+** Channels
+
+=iter/entries!=, =iter/keys!= and =iter/values!= return a core.async channel that yields,
+respectively, ={:key k :value v}= maps, keys, or values in key order and then closes.
+Reads are lazy and backpressured: the producer fetches =:batch-size= items per upstream
+=nextv= (default 100), parks when the channel buffer (=:buffer=, default 32) is full, and
+at most one upstream read is ever in flight per iterator.
+
+#+begin_src clojure
+(iter/entries! c {:gte "k100" :lt "k200"     ; bounds, encoded with the key codec
+                  :reverse false
+                  :limit 50                  ; nil / -1 unlimited, 0 nothing
+                  :keys-only? false          ; or :values-only? — the other slot is omitted from the map
+                  :snapshot s                ; an explicit snapshot handle
+                  :fill-cache true
+                  :high-water-mark-bytes 16384
+                  :batch-size 100 :buffer 32})
+#+end_src
+
+** Ranges, reverse and limit
+
+Bounds are inclusive (=:gte= / =:lte=) or exclusive (=:gt= / =:lt=) and compare on the
+*encoded* key bytes. Verified live on 201 entries (smoke section 3):
+
+| option                    | result                                            |
+|---------------------------+---------------------------------------------------|
+| =:gte "k198"=             | ="k198" "k199"=                                   |
+| =:gt "k198"=              | ="k199"=                                          |
+| =:lte "k001"=             | ="" "k000" "k001"= — the empty-string key sorts first |
+| =:lt "k001"=              | ="" "k000"=                                       |
+| =:lte ""=                 | =""= — the empty string is a real key and a real bound |
+| =:gt "" :limit 2=         | ="k000" "k001"=                                   |
+| =:reverse true :limit 3=  | ="k199" "k198" "k197"= — the *last* three          |
+
+=nil= bounds are dropped (upstream would encode =null= as the string ="null"=, inventory
+pitfall 8.5). =:limit= is validated (=util/check-limit!=): nil or =-1= is unlimited, =0=
+yields nothing, a negative other than -1 or a non-integer is an =argument-error=.
+
+** =collect!=, =reduce!= and the =-seq!= helpers
+
+#+begin_src clojure
+(iter/collect! (iter/keys! c {:gte "a"}))          ; promise of a vector; an error item rejects
+(iter/entries-seq! c {:limit 100})                 ; = (collect! (entries! c opts))
+(iter/keys-seq! c opts) (iter/values-seq! c opts)
+(iter/reduce! (fn [acc {:keys [key value]}]
+                (if (= key "stop") (reduced acc) (conj acc value)))
+              [] (iter/entries! c))                ; (reduced v) closes the channel — the iterator is released
+#+end_src
+
+=core/all!=, =core/keys!= and =core/values!= are the promise-only equivalents built on the
+raw handles (=it-all!=): fine for bounded ranges, they load everything into memory.
+
+** Errors on a channel
+
+A channel-returning function never throws: an =argument-error= (bad option, bad
+=:batch-size=), a =db-error= (=:database-not-open=) or a =codec-error= (decode failure) is
+put on the channel as its *last* item, then the channel closes; test items with
+=iter/error?=. =collect!= / =reduce!= / the =-seq!= helpers turn that into a rejection.
+
+** Cancel semantics
+
+Closing the channel (=async/close!=) cancels the iteration: the producer notices at its
+next put — immediately when it is parked on a full buffer, otherwise within
+=iter/cancel-poll-ms= (100 ms) — closes the upstream iterator and stops. The upstream
+iterator is closed *before* the channel closes in every path (end, error, cancel), so a
+consumer that sees the channel end knows the iterator is released; =open-resources=
+proves it (=:iterators= back to 0 within three poll intervals in smoke section 3).
+
+The *cancel-poll note*: core.async does not wake a parked put when the channel is closed,
+so a producer parked on a full buffer must poll. =util/put-or-cancel!= races the put
+against a =cancel-poll-ms= timeout and re-checks =closed?= on every tick; the same helper
+drives the events channel. Abort signals are not exposed (inventory 9.5).
+
+** Raw handles and =seek=
+
+=core/iterator=, =key-iterator= and =value-iterator= are the synchronous handle
+constructors; =it-next!= (one item or nil), =it-nextv!= (up to n), =it-all!= (the rest,
+closes), =it-seek!= (reposition; synchronous and *throws =:iterator-busy= while a read is
+in flight*, inventory 5.1), =it-close!=, =it-count=, =it-open?=. =seek= is deliberately
+absent from the channel API because a channel always has a read in flight; use the handle
+when you need it:
+
+#+begin_src clojure
+(p/let [it (db/iterator c {:keys-only? true})
+        _ (db/it-seek! it "m")
+        [a b] (db/it-nextv! it 2)
+        _ (db/it-close! it)]
+  [a b])
+#+end_src
+
+* Events channel
+
+=level@10= (abstract-level 3) emits =opening=, =open=, =closing=, =closed= (no arguments),
+=write= (an array of normalised ops after any =put= / =del= / =batch= / chained =write=
+succeeded) and =clear= (the options object); the legacy =put= / =del= / =batch= events are
+gone — adding such a listener prints one =LEVEL_LEGACY= warning and it never fires
+(inventory 6.1, pitfall 8.16). =(db/events! c & [opts])= exposes that surface as one
+core.async channel and *derives* =:put= / =:del= / =:batch= from =write=:
+
+| event map                                                          | from upstream                                                |
+|--------------------------------------------------------------------+--------------------------------------------------------------|
+| ={:event :opening}= ={:event :open}= ={:event :closing}= ={:event :closed}= | the lifecycle events                                 |
+| ={:event :put :key k :value v}=                                    | a one-op =write= of type put (=put!=, a one-op =batch!=, a one-op chained write) |
+| ={:event :del :key k}=                                             | a one-op =write= of type del                                 |
+| ={:event :batch :ops [{:type :put :key k :value v} {:type :del :key k} …]}= | a =write= of two or more ops, in order              |
+| ={:event :clear [:gt/:gte/:lt/:lte bound] [:limit n] [:reverse b]}= | =clear= — only the options that were given                  |
+
+Upstream cannot tell a one-op =batch!= from a =put!=, hence the one-op rule. Keys, values
+and bounds are decoded with the *client's* codecs (the event side does not know about
+per-call overrides: a value written with =:value-encoding :utf8= on an =:edn= client
+arrives as the EDN reader sees its text). =:sublevel true= marks an op that was routed
+with the =:sublevel= batch option; its =:key= is then the prefixed key — upstream nulls the
+sublevel reference before emitting, so the prefix itself is only recoverable from the
+key. Writes made *through a sublevel client* reach the parent's channel too, with the
+prefixed key and the raw stored value (the same view a root iterator gives), while the
+sublevel's own channel reports its unprefixed keys; on =memory-level= the parent-level
+payload arrives as bytes and is turned into text for a utf8-format codec so both backends
+report the same (inventory pitfall 8.15). A decode failure keeps the raw value and adds
+=:decode-error= (the =codec-error=) instead of killing the subscription.
+
+#+begin_src clojure
+(let [ch (db/events! c {:buffer 64 :only #{:put :del :batch :clear}})]
+  (go-loop []
+    (when-some [ev (<! ch)]
+      (prn ev)
+      (recur))))
+;; after (db/put! c "a" "1") (db/del! c "a")
+;;       (db/batch! c [{:type :put :key "b" :value "2"} {:type :del :key "c"}])
+;;       (db/clear! c {:gte "x" :lt "y"}) (db/close! c):
+;; {:event :put :key "a" :value "1"}
+;; {:event :del :key "a"}
+;; {:event :batch :ops [{:type :put :key "b" :value "2"} {:type :del :key "c"}]}
+;; {:event :clear :gte "x" :lt "y"}
+;; (:closing / :closed filtered out by :only; without it they are the last two items)
+#+end_src
+
+Semantics:
+
+- *Order is emission order.* Listeners run synchronously inside upstream and append to a
+  queue that one loop drains into the channel, so the channel never reorders. A write
+  cannot be held back, so the queue is unbounded while the consumer lags; keep up or use
+  =:only=.
+- *The channel closes after ={:event :closed}=* — =close!= of the client or of its root.
+  A subscription does not survive a reopen; subscribing on a *closed root* client is
+  allowed and delivers =:opening= / =:open= when =open!= is called (close the channel
+  yourself if that never comes).
+- *Closing the channel unsubscribes.* The upstream listeners are removed at the next
+  event, when a parked put notices, or within =util/cancel-poll-ms= while idle (the same
+  cancel-poll pattern as iterators); =(:subscriptions (db/open-resources c))= drops to 0.
+  While a subscription is live a poll timer ticks, so close the channel or the client
+  before expecting the Node process to exit on its own.
+- *Never throws.* A bad option (=:only= outside =db/event-names=, a non-positive
+  =:buffer=, an unknown key), a non-client argument or a =db-error= from the handle
+  arrives as the channel's only item, then the channel closes.
+- Events on the on-disk backend verified live in smoke sections 5 (lifecycle) and 6
+  (writes and clear).
+
+Hooks (=prewrite= / =postopen= / =newsub=) are experimental upstream and not exposed
+(inventory 6.2, 9.6).
+
+* =clear!= and persistence
+
+** =clear!=
+
+=(db/clear! c)= deletes every entry of the client (the whole database for a root, one
+namespace for a sublevel); with =:gt= / =:gte= / =:lt= / =:lte= it deletes a range,
+=:limit n= caps the count (the *last* n with =:reverse true=), =:snapshot= clears what a
+snapshot saw. Bounds are encoded with the key codec. It is *not atomic* (inventory 9.18):
+a concurrent writer may interleave with it. When atomicity matters, iterate the keys into
+a =batch!= of =:del= ops instead:
+
+#+begin_src clojure
+(p/let [ks (db/keys! c {:gte "tmp:" :lt "tmp;"})]
+  (db/batch! c (mapv (fn [k] {:type :del :key k}) ks)))
+#+end_src
+
+** Persistence across =close!= / =open!=
+
+LevelDB is durable on =close!=: values written before a close are read back by a fresh
+client on the same path and by the same client after =open!=. Verified live (smoke
+section 5): after ten EDN puts into a sublevel and a range =clear!=, =close!= turned the
+status to =:closed=, =(db/open! path)= with a new client read the stored EDN text under
+the prefixed key, and =(db/open! c)= of the original client decoded the same entry through
+its sublevel again — with the =:closing= / =:closed= events observed on the way and the
+directory holding =CURRENT=, =LOCK=, =LOG=, =MANIFEST-*= and =.ldb= / =.log= files.
+
+Status transitions are =:open= ⇒ =:closing= ⇒ =:closed= ⇒ =:opening= ⇒ =:open=; only
+=:open= accepts operations (the library never hands out an =:opening= client). Two
+clients cannot hold the same directory: the second =open!= rejects with
+=:database-not-open= and =:reason :locked= while the first is open (smoke section 0), and
+the lock is released by =close!=. =:sync true= on writes is the knob for durability
+against power loss between writes and close.
+
+* Error handling
+
+Every rejection and every synchronous throw is an =ex-info=. Dispatch on
+=(db/error-type e)= (re-exported from =util=), read =(db/error-code e)= for the upstream
+code, =(db/error-data e)= for the whole data map (nil for a foreign error), and
+=(db/not-open? e)= for the common "used after close" case. =util/error-types= is the set.
+
+| =:type=                          | when                                                                                                                    | extra =ex-data= keys |
+|----------------------------------+-------------------------------------------------------------------------------------------------------------------------+---------------------|
+| =:leveldb-cljs/db-error=         | anything upstream threw or rejected: a =LEVEL_*= =ModuleError= or a plain =TypeError=                                    | =:code= (the kebab =LEVEL_*= code, nil for non-Level errors) =:message= =:cause= (the upstream error) =:name= =:op= (the leveldb-cljs operation, =:open= =:get= =:batch-put= …) =:cause-code= / =:cause-message= (from the upstream =cause=) =:reason= (open failures) |
+| =:leveldb-cljs/argument-error=   | detected *before* any upstream call: a non-client first argument, an unknown option key, a bad =:limit=, a nil key or value, a malformed batch op (=:index=), a foreign-root or non-sublevel =:sublevel=, a non-string sublevel name, an unknown codec keyword or malformed codec map, a non-hex string for =hex->bytes= … | =:arg= =:value= =:op= plus =:unknown= / =:allowed= for options, =:index= for batch ops |
+| =:leveldb-cljs/codec-error=      | a value the codec's =:check= rejects (the silent-stringify guard), an =:encode= that threw, or a =:decode= that threw (unreadable EDN / JSON under that codec) | =:codec= =:direction= (=:encode= / =:decode=) =:role= (=:key= / =:value=) =:value= =:cause= |
+
+** Codes
+
+=:code= is the upstream =LEVEL_*= string with the prefix dropped and kebab-cased
+(=util/level-code->keyword=): =LEVEL_DATABASE_NOT_OPEN= ⇒ =:database-not-open=. The
+ones you will meet:
+
+| =:code=                                                              | meaning                                                                                             |
+|----------------------------------------------------------------------+-----------------------------------------------------------------------------------------------------|
+| =:database-not-open=                                                 | an operation on a closed client, or a *failed open* (then with =:reason= and =:cause-code= / =:cause-message=) |
+| =:locked=                                                            | appears as =:cause-code= of a failed open: the directory is held by another process or instance (the LevelDB =LOCK= file); =:reason :locked= |
+| =:iterator-not-open= =:batch-not-open= =:snapshot-not-open=          | a handle used after its close (=db/not-open?= covers all four not-open codes)                        |
+| =:iterator-busy=                                                     | a second read or a =seek= while a read is in flight (the channel API never causes it)                |
+| =:invalid-prefix=                                                    | a sublevel name outside printable ASCII above ="=                                                    |
+| =:invalid-key= =:invalid-value=                                      | upstream validation — normally pre-empted by the argument / codec checks                             |
+| =:decode-error= =:encoding-not-supported=                            | upstream's own decode failure / an encoding the backend cannot store (memory stores as bytes)        |
+| =:not-supported=                                                     | a feature the manifest lists as absent, e.g. =snapshot= on =browser-level= (both backends here support explicit snapshots) |
+| =:legacy= =:aborted= =:encoding-not-found=                           | legacy event names (not reachable through this library) / aborted iterators (signals not exposed) / an upstream encoding name that does not exist (pre-empted by =codec/resolve=) |
+
+Match on =:code=, never on the message text: abstract-level rewrites messages between
+minors (inventory pitfall 8.22). The one exception the library takes on itself is
+=:reason= for failed opens, derived from the cause message for =:missing= / =:exists= /
+=:io= (inventory 9.4) — treat it as a hint and =:cause-message= as the evidence.
+
+** Synchronous and asynchronous, one shape
+
+Upstream throws synchronously from constructors (=sublevel=, =iterator=, =batch()=,
+=snapshot=), from chained-batch =put= / =del= / =clear=, from =seek= and =getSync=, and
+rejects from everything else (inventory 3.3). =leveldb-cljs= keeps that split deliberately
+visible in the *calling convention* — the synchronous functions return values and throw,
+the =!= I/O functions return promises — but every error, whichever way it travelled,
+passes through the same normaliser: a =!= function *never* throws (a synchronous upstream
+throw inside it becomes a rejection with the same data), a synchronous function throws
+the normalised =ex-info=, and both carry =:op=.
+
+#+begin_src clojure
+(-> (db/get! c "k")
+    (p/catch (fn [e]
+               (case (db/error-type e)
+                 :leveldb-cljs/db-error       (if (db/not-open? e)
+                                                (reopen-and-retry c)
+                                                (println "level" (db/error-code e) (ex-message e)))
+                 :leveldb-cljs/argument-error (println "bad call:" (ex-message e) (:arg (ex-data e)))
+                 :leveldb-cljs/codec-error    (println "codec" (:codec (ex-data e)) (:direction (ex-data e)) (ex-message e))
+                 (throw e)))))
+#+end_src
+
+** Open failures
+
+#+begin_src clojure
+(-> (db/open! "./data")
+    (p/catch (fn [e]
+               (let [{:keys [code reason cause-code cause-message]} (ex-data e)]
+                 ;; code :database-not-open
+                 (case reason
+                   :locked  (println "held by another process:" cause-code cause-message) ; :locked "..."
+                   :missing (println "no such database and :create-if-missing? false")
+                   :exists  (println ":error-if-exists? true and it exists")
+                   :io      (println "I/O error:" cause-message)
+                   (println "open failed:" cause-message))))))
+#+end_src
+
+Verified live (smoke section 0): a second =open!= of a directory already open in the same
+process rejects with =:code :database-not-open=, =:reason :locked=, =:cause-code :locked=,
+message ="Database failed to open"=. Only =LEVEL_LOCKED= carries its own upstream code; the
+other causes are message-only (inventory 3.4).
+
+** Errors on channels
+
+Iterator channels and the events channel never throw and never reject: an error is the
+last item before the channel closes (=iter/error?=), and the promise helpers convert it
+into a rejection. User code that throws inside =with-batch!= / =with-snapshot!= passes
+through untouched (any =ex-info= is left as is; only JS errors are wrapped).
+
+* Design decisions
+
+- *One binding namespace, =js-invoke= instead of =^js=.* The house rule forbids =^js=
+  hints and interop outside the binding; the binding itself calls upstream methods by
+  name with =js-invoke= (=(js-invoke db "getSync" k opts)=) and reads properties with
+  =unchecked-get=. Both survive =:advanced= compilation without externs because the
+  names are string literals, which is what =^js= would buy — without spreading type
+  hints through the code and without a second interop namespace. The cost is a
+  string-typed method name; the tests exercise every one against both backends.
+- *=core= is both the binding and the client.* The inventory sketched a separate
+  =leveldb-cljs.binding= (10.2). Merging it into =core= removed a layer whose only job
+  would have been to re-expose the same functions: every public =core= function is one
+  =run= / =run-sync= adapter around one upstream call plus codec work, and =iter= /
+  the events loop sit on top of =core= handles without touching upstream. The rule is
+  unchanged: nothing outside =core= requires =level=.
+- *Library-side JSON over utf8.* =:json= does not use upstream's =json= encoding: it
+  =JSON.stringify=s a =clj->js= conversion and stores under =utf8=. Upstream's =json=
+  would receive a ClojureScript map as a JS object with its internal fields (or, through
+  =level-transcoder=, whatever =JSON.stringify= makes of it) — pitfall 8.8. Doing it in
+  =codec= keeps the =clj->js= / =js->clj= (keywordized) round trip explicit and lets
+  =:check= run first. The store bytes are ordinary JSON text readable by any other client.
+- *EDN reads the first form.* =:edn= decodes with =cljs.reader/read-string=, the EDN
+  reader (no =#=()= evaluation, inventory 9.12), which reads the *first* form and ignores
+  trailing text: ="{:a 1} junk"= decodes to ={:a 1}=. That is the reader's documented
+  contract and it is faster than validating the remainder; an empty string is a
+  =codec-error= (the reader would otherwise return nil and masquerade as "absent" — a
+  correction recorded in the Phase 2 inventory notes). EDN is the recommended value codec
+  for ClojureScript data because it is exact; =:json= exists for interop with other
+  readers of the same database.
+- *Codec discipline.* Keys, values and bounds are encoded *before* upstream sees them and
+  decoded *after*, so upstream only ever receives its own =utf8= / =buffer= / =view=
+  (=hex= / =base64=) encodings. The alternative — handing upstream a transcoder-shaped
+  object per codec — would put ClojureScript values in upstream's hands at exactly the
+  point where it stringifies silently, and would leak per-call codec objects into the
+  =write= event payload.
+- *Eager open.* =open!= awaits =db.open()= (inventory 9.11) so that open failures surface
+  once, at the call that can handle them, and =chained-batch= (which upstream refuses
+  while =opening=) always works on a client you hold. A =:defer?= option can be added if
+  a use case appears.
+- *Sublevel clients survive a reopen.* Upstream sublevel handles are dead after their
+  parent closes (9.13); rather than making users re-create every sublevel after every
+  reopen, the client re-derives its handle when the root's open generation moved.
+- *Root-identity checks on batch ops.* Upstream silently misroutes a foreign-root
+  sublevel (9.2); the check costs one =identical?= per op and turns data loss into an
+  =argument-error=.
+- *Unknown options are errors.* Upstream shallow-merges options and ignores unknown keys
+  (pitfall 8.17), so a typo (=:fillCache=, =:key-encoding?=) would silently do nothing;
+  every operation has a whitelist. The =?= suffix on booleans is stripped, so both
+  =:keys-only= and =:keys-only?= are accepted.
+- *=get-sync= is exposed, and named for what it does.* It blocks the loop (9.15) but is the
+  fastest read available; hiding it would push users to interop.
+- *Close-to-cancel, no abort signals.* Upstream's =AbortSignal= support is experimental and
+  the manifest disagrees with the behaviour (9.5); closing the channel is the idiomatic
+  core.async cancellation and the cancel-poll makes it reliable even for a parked put.
+- *Events are derived, not renamed.* The upstream =write= payload is the truth; =:put= /
+  =:del= / =:batch= are a faithful projection of it (one op / several ops), with the
+  documented one-op-batch ambiguity, rather than a resurrection of the removed legacy
+  events.
+- *=clear!= stays non-atomic and says so.* Wrapping it in a keys-into-batch loop would hide
+  a cost and a semantic change; the manual shows the loop for when it is wanted.
+- *Admin extras are not exposed.* classic-level's =approximateSize=, =compactRange=,
+  =getProperty=, =destroy= and =repair= (inventory 2.11, 11.6) are out of this release:
+  none of them is needed to use a database correctly, =approximateSize= is approximate by
+  contract, and =destroy= / =repair= on a directory that another client holds are
+  footguns. They remain the natural next namespace if wanted.
+
+* Testing and the live smoke
+
+#+begin_src bash
+npm install
+./run-tests.sh                                        # cljs.test suite: 67 tests / 838 assertions, no network; exit status reflects pass/fail (~3 s after the compile)
+npx shadow-cljs watch node-test                       # re-runs the suite on every change (autorun)
+npx shadow-cljs compile smoke && node target/smoke.js # LIVE smoke: a real on-disk classic-level database in a temp dir + memory-level; no network
+#+end_src
+
+- *=run-tests.sh=* compiles the =:node-test= build with autorun disabled (shadow does not
+  propagate the autorun exit status) and =exec=s =node target/node-test.js= — nothing placed
+  after that line in the script would run, so never chain it mid-command inside another
+  script. The suite (=test/leveldb_cljs/=) covers: the kebab ⇄ camel translation, code
+  translation, error constructors, option normalisation and batch-op validation
+  (=util_test=); every builtin codec, the silent-stringify guard, custom codec maps and the
+  EDN edge cases (=codec_test=); lifecycle, open failures (missing directory, exists,
+  locked), every read and write, batches (array, chained, =with-batch!=, sublevel ops and
+  the cross-root rejection), sublevels (nesting, inheritance, reopen re-derivation),
+  snapshots, iterator handles, bytes helpers and the error normalisation of both delivery
+  paths (=core_test=); the channels, ranges, backpressure, cancel and the promise helpers
+  (=iter_test=); and the events channel — order across put / del / batch / chained /
+  clear / close on both backends, reopen, sublevel and root views, codec decoding and
+  =:decode-error=, listener release on channel close, option errors (=events_test=).
+  =test_util= runs most tests on =memory-level= in process *and* on a temporary on-disk
+  =level= database (created under the OS temp dir — or =$CLAUDE_JOB_DIR/tmp= when set —
+  and removed afterwards). No network anywhere.
+- *REPL*: =npx shadow-cljs watch dev= (terminal 1), =node target/dev.js= (terminal 2),
+  =npx shadow-cljs cljs-repl dev= (terminal 3). The shadow Node REPL does not await
+  promises; capture results into an atom: =(def r (atom nil)) (p/-> (db/get! c "k")
+  #(reset! r %))= then deref.
+- =shadow-cljs.edn= is standalone (declares =funcool/promesa= itself; core.async ships with
+  shadow) so =npx shadow-cljs ...= only needs Java and =node_modules=; =deps.edn= mirrors
+  the dependencies for consumers. Builds: =:node-test=, =:dev=, =:smoke=.
+
+** The live smoke
+
+=dev/leveldb_cljs/smoke.cljs= is the phase-4 live verification: a real =classic-level=
+database in a fresh directory under the OS temp dir (=os.tmpdir= + =mkdtemp=, removed in
+every case), opened side by side with a =memory-level= one and driven only through the
+public API. The filesystem is the live part; nothing touches the network. It is not part
+of =run-tests.sh=.
+
+Sections run in order and never abort early: each prints =PASS <name> — <detail>= or
+=FAIL <name>: <reason>=, a tally comes last, and the exit code is 0 only when every section
+passed.
+
+| # | section                                                  | what it proves                                                                                                                                       |
+|---+----------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 0 | =open!= on-disk + memory, platform report, lock            | both backends open; =process.platform= / =arch= / Node, =level= / =classic-level= versions, whether the prebuild directory for this platform exists and whether a local compile happened (inventory 9.10); a second =open!= of the same directory rejects =:database-not-open= / =:reason :locked=; the directory holds =MANIFEST-*=; =supports.events= lists all six |
+| 1 | round-trips                                              | =put!= / =get!= with =:utf8= =:json= =:edn= =:raw= =:hex= values, =has!=, =get-many!= with a nil slot, =get-sync=, =del!= of present and absent keys |
+| 2 | batches                                                  | an array batch with put / put / del of the same key and a =:sublevel= op; a chained batch with a =:sublevel= op, =batch-length=, =:batch-not-open= after write; =with-batch!=; =batch-close!= discards; the root reads the sublevel's EDN text |
+| 3 | iterators                                                | 201 entries drained through a channel; =:gte= / =:gt= / =:lte= / =:lt= incl. the empty-string key; =:reverse= + =:limit=; =:keys-only?= / =:values-only?=; closing a channel with =:buffer 1= releases the iterator (=open-resources= 1 ⇒ 0); =reduce!= early stop releases it too |
+| 4 | sublevels                                                | isolation of =a= / =b= / =a!inner=, prefixes and paths, cross-root =:sublevel= rejected in =batch!= and =batch-put!=, =:closed= status and =:database-not-open= after the root closes, the same sublevel clients read again after reopen, =:invalid-prefix= |
+| 5 | =clear!= + persistence                                    | range =clear!= on a sublevel and on a root range; =close!= ⇒ =:closed=, a fresh client on the same path reads the stored EDN text, =open!= of the original client decodes it again; =:closing= / =:closed= events then channel close; the directory file list |
+| 6 | events                                                   | =:put= =:del= =:batch= =:clear= in order on the on-disk database; closing the channel releases the listeners (=:subscriptions= 1 ⇒ 0) |
+| 7 | codec edges                                              | the silent-stringify guard on a =:utf8= map value and map key, nil value ⇒ =argument-error=, missing key ⇒ nil for =get!= and =get-sync=, bad hex ⇒ =codec-error=, unknown codec and a camelCase option key ⇒ =argument-error= |
+
+The reference run of 2026-09-25 passed 8/8 on Linux x64, Node 22.23.2, =level= 10.0.0 /
+=classic-level= 3.0.0 with the shipped =linux-x64= prebuild (=classic-level.node= +
+=classic-level.musl.node=, no local =build/= directory).
+
+* API reference
+
+One row per public function or constant: name, arguments, one line. I/O functions take
+the client (or handle) first and return a promesa promise; the synchronous ones are
+marked *sync* (they return a value and throw); pure helpers (no I/O, no upstream objects)
+are marked *pure*. Every name below exists in =src/= (checked by script when this manual
+was written).
+
+** =leveldb-cljs.core=
+
+*** Clients and lifecycle
+
+| fn                                          | what                                                                                                            |
+|---------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =open! [x]=                                 | a path string, an options map (=:path= / =:location=, =:memory?=, =:key-encoding=, =:value-encoding=, the open / tuning options) or a client to reopen ⇒ promise of an *open* client |
+| =close! [c]=                                | closes the root and everything under it (a sublevel client: only that subtree); idempotent; resolves nil        |
+| =status [c]=                                | =:opening= / =:open= / =:closing= / =:closed= (*sync*)                                                         |
+| =open? [c]=                                 | =(= :open (status c))= (*sync*)                                                                                 |
+| =supports [c]=                              | the kebab =db.supports= manifest (*sync*)                                                                       |
+| =location [c]= / =backend [c]=              | the root's directory (nil for memory) / =:level= or =:memory=                                                   |
+| =key-encoding [c]= / =value-encoding [c]=   | ={:name :format :upstream}= of the client's default codecs                                                      |
+| =open-resources [c]=                        | ={:iterators :snapshots :batches :subscriptions}= not yet closed / released under this root                     |
+| =client? [x]= / =root? [c]= / =root [c]= / =parent [c]= | client predicates and navigation (*pure*)                                                           |
+| =open-options= =read-options= =has-options= =put-options= =del-options= =batch-options= =batch-op-options= =iterator-options= =clear-options= =sublevel-options= =seek-options= =write-options= | the option whitelists (sets of kebab keywords without =?=) |
+
+*** Reads and writes
+
+| fn                                          | what                                                                                                            |
+|---------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =get! [c key & [opts]]=                     | the decoded value or nil; =:key-encoding :value-encoding :snapshot :fill-cache=                                 |
+| =get-sync [c key & [opts]]=                 | same, blocking the event loop (*sync*)                                                                          |
+| =get-many! [c keys & [opts]]=               | vector of values, nil at absent positions                                                                       |
+| =has! [c key & [opts]]= / =has-many! [c keys & [opts]]= | boolean / vector of booleans; =:key-encoding :snapshot=                                             |
+| =put! [c key value & [opts]]=               | stores; =:key-encoding :value-encoding :sync=; resolves nil                                                     |
+| =del! [c key & [opts]]=                     | deletes (absent is fine); =:key-encoding :sync=                                                                 |
+| =batch! [c ops & [opts]]=                   | atomic vector of ={:type :put/:del :key :value :key-encoding :value-encoding :sublevel}= ops; =:key-encoding :value-encoding :sync= |
+| =clear! [c & [opts]]=                       | deletes all or a range (=:gt :gte :lt :lte :reverse :limit :key-encoding :snapshot=); not atomic                 |
+| =all! [c & [opts]]= / =keys! [c & [opts]]= / =values! [c & [opts]]= | promise of a vector of entries / keys / values for iterator options (loads everything)  |
+
+*** Sublevels and snapshots
+
+| fn                                          | what                                                                                                            |
+|---------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =sublevel [c name & [opts]]=                | a sublevel client (string or vector name; =:separator :key-encoding :value-encoding=; codecs inherit) (*sync*)  |
+| =prefix [c]= / =path [c & [local?]]=        | ="!people!"= (="" for a root) / the vector of names from the root (*sync*)                                       |
+| =snapshot [c]=                              | an explicit snapshot handle (*sync*; =:not-supported= where unsupported)                                        |
+| =close-snapshot! [s]=                       | closes it (idempotent)                                                                                          |
+| =with-snapshot! [c f]=                      | =(f snapshot)= then close in a finally; resolves f's result                                                     |
+
+*** Chained batches
+
+| fn                                          | what                                                                                                            |
+|---------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =chained-batch [c]=                         | a batch handle (*sync*; the client must be open)                                                                |
+| =batch-put! [b key value & [opts]]= / =batch-del! [b key & [opts]]= | queue an op (=:key-encoding :value-encoding :sublevel=); return the batch (*sync*)       |
+| =batch-clear! [b]=                          | drop every queued op (*sync*)                                                                                   |
+| =batch-length [b]=                          | queued op count (*sync*)                                                                                        |
+| =batch-write! [b & [opts]]=                 | commit atomically (=:sync=) and close                                                                           |
+| =batch-close! [b]=                          | discard without writing (idempotent)                                                                            |
+| =with-batch! [c f]=                         | =(f batch)= then write; close and rethrow on error                                                              |
+
+*** Iterator handles
+
+| fn                                          | what                                                                                                            |
+|---------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =iterator [c & [opts]]= / =key-iterator [c & [opts]]= / =value-iterator [c & [opts]]= | handle constructors (*sync*); =:gt :gte :lt :lte :reverse :limit :keys-only? :values-only? :key-encoding :value-encoding :snapshot :fill-cache :high-water-mark-bytes= |
+| =it-next! [it]=                             | next item (={:key :value}= / key / value) or nil at the end                                                     |
+| =it-nextv! [it n]=                          | vector of up to n items (=[]= at the end)                                                                       |
+| =it-all! [it]=                              | vector of the rest; closes the iterator                                                                         |
+| =it-seek! [it target & [opts]]=             | reposition (*sync*; throws =:iterator-busy= during a read; =:key-encoding=)                                     |
+| =it-close! [it]=                            | close (idempotent)                                                                                              |
+| =it-count [it]= / =it-open? [it]=           | items yielded so far / still open (*sync*)                                                                      |
+
+*** Events
+
+| fn                                          | what                                                                                                            |
+|---------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =events! [c & [opts]]=                      | core.async channel of ={:event ...}= maps (=:opening :open :closing :closed :put :del :batch :clear=); =:buffer= (32), =:only= (set); closes after =:closed=; close it to unsubscribe |
+| =event-names= / =events-options=            | the set of event keywords / the option whitelist                                                                |
+
+*** Bytes and errors
+
+| fn                                          | what                                                                                                            |
+|---------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =bytes? [x]=                                | Buffer / Uint8Array predicate                                                                                   |
+| =bytes->hex= =hex->bytes= =bytes->base64= =base64->bytes= =bytes->utf8= =utf8->bytes= | conversions (argument-error on malformed input)                                       |
+| =bytes-length [b]= / =bytes= [a b]=         | byte length / byte equality                                                                                     |
+| =error-data [e]= =error-type [e]= =error-code [e]= =not-open? [e]= | re-exports of the =util= error helpers (*pure*)                                                   |
+
+** =leveldb-cljs.iter= (no interop)
+
+| fn                                          | what                                                                                                            |
+|---------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =entries! [c & [opts]]=                     | channel of ={:key k :value v}= in key order; iterator options + =:batch-size= (100) + =:buffer= (32); close to cancel |
+| =keys! [c & [opts]]= / =values! [c & [opts]]= | channels of keys / values                                                                                     |
+| =collect! [ch]=                             | promise of a vector; an error item rejects                                                                      |
+| =reduce! [f init ch]=                       | promise of the fold; =(reduced v)= stops and closes the channel                                                 |
+| =entries-seq! [c & [opts]]= / =keys-seq! [c & [opts]]= / =values-seq! [c & [opts]]= | =(collect! (entries! c opts))= and friends                                            |
+| =error? [x]=                                | true for an error item (*pure*)                                                                                 |
+| =default-batch-size= =default-buffer= =cancel-poll-ms= =channel-options= | constants (100, 32, 100 ms, =#{:batch-size :buffer}=)                                        |
+
+** =leveldb-cljs.codec= (pure; =JSON.stringify= / =JSON.parse= only)
+
+| fn                                          | what                                                                                                            |
+|---------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =resolve [x]=                               | keyword or codec map ⇒ validated codec map ={:name :format :upstream :encode :decode :check :expects}=          |
+| =encode [codec v & [role]]= / =decode [codec s & [role]]= | encode (argument-error for nil, codec-error otherwise) / decode (nil passes through)               |
+| =check-value! [codec v & [role]]=           | the silent-stringify guard on its own                                                                           |
+| =utf8-codec= =json-codec= =edn-codec [& [{:keys [readers default]}]]= =hex-codec= =base64-codec= =buffer-codec= =view-codec= =raw-codec= | the builtin constructors                        |
+| =builtin= / =names []=                      | keyword ⇒ constructor map / sorted keywords                                                                     |
+| =codec? [x]= / =describe [codec]=           | resolved-codec predicate / ={:name :format :upstream}=                                                          |
+| =bytes? [x]= =hex-string? [x]= =base64-string? [x]= | value predicates                                                                                        |
+| =formats= / =format->upstream=              | =#{:utf8 :buffer :view}= / the upstream names                                                                   |
+
+** =leveldb-cljs.util= (pure; core.async only)
+
+| fn                                          | what                                                                                                            |
+|---------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =kebab->camel [k]= / =camel->kebab [k]=     | key case translation (keywords and strings; namespaced keywords untouched)                                      |
+| =transform-keys [f x]= / =[f passthrough x]= | deep key transform with a pass-through key set                                                                 |
+| =->camel-keys [opts]= / =->kebab-keys [x]=  | option map ⇒ camelCase string keys (nil dropped, =option-passthrough-keys= verbatim) / deep camel ⇒ kebab        |
+| =option-passthrough-keys=                   | =#{:value :key :gt :gte :lt :lte :snapshot :sublevel :signal}=                                                  |
+| =level-code->keyword [code]=                | ="LEVEL_DATABASE_NOT_OPEN"= ⇒ =:database-not-open=                                                              |
+| =db-error [code message & [data]]= =argument-error [message & [data]]= =codec-error [message & [data]]= | =ex-info= constructors                                              |
+| =error-data [e]= =error-type [e]= =error-code [e]= =not-open? [e]= | structured data / =:type= / =:code= / the not-open test                                          |
+| =error-types= / =not-open-codes=            | the three =:type= keywords / the four not-open codes                                                            |
+| =strip-question-mark [k]= / =normalize-opts [opts]= | =:keys-only?= ⇒ =:keys-only= / strip suffixes and drop nils                                             |
+| =check-opts! [op allowed opts]=             | argument-error for a non-map or an unknown key                                                                  |
+| =check-limit! [op opts]=                    | validates =:limit= (nil / -1 unlimited, 0 nothing)                                                              |
+| =range-keys=                                | =#{:gt :gte :lt :lte}=                                                                                          |
+| =valid-op-type? [t]= / =normalize-op [idx op]= | batch-op validation                                                                                          |
+| =cancel-poll-ms= / =chan-closed? [ch]= / =put-or-cancel! [ch v]= | the cancel-poll helper shared by iterator and event channels (100 ms)                              |

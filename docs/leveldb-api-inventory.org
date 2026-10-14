@@ -1,0 +1,935 @@
+#+TITLE: LevelDB (level / classic-level / abstract-level) API inventory — leveldb-cljs phase 1
+#+DATE: 2026-09-25
+#+STARTUP: overview
+#+OPTIONS: toc:3
+
+* About this document
+This is the verified inventory of the JavaScript LevelDB surface that leveldb-cljs wraps.
+It is research only; implementation happens in later phases (section 11 is the Phase 2 outline).
+
+*Product constraint that shapes everything below:* the finished library is
+ClojureScript-only at every call site: no =^js= hints, no JS interop outside ONE binding
+namespace, kebab-case keyword maps in and out, promesa promises for every async
+operation, core.async channels for iterators, and zero runtime npm dependencies beyond
+the wrapped package (=level=, which in Node.js *is* =classic-level=). Every upstream fact
+below is therefore paired with the consequence for that design (sections 10 and 11).
+
+** Method and evidence tags
+Every fact carries one or more evidence tags:
+- =[README x]= — the README of package =x= as published: read from the GitHub default
+  branch (=Level/level= master, =Level/classic-level= main, =Level/abstract-level= main,
+  =Level/memory-level= main) and cross-checked with =npm view x readme= on 2026-09-25. The
+  npm copy of the abstract-level README is truncated at 64 KB; the GitHub copy (1957
+  lines) is the one used. Both copies of the level / classic-level / memory-level
+  READMEs were byte-identical.
+- =[UPGRADING x]= / =[CHANGELOG x]= — the UPGRADING.md / CHANGELOG.md of package =x=
+  (same sources and date).
+- =[NPM]= — =npm view= registry metadata fetched 2026-09-25 (versions, dist-tags,
+  engines, dependencies, deprecation notices, publish times).
+- =[LIVE]= — observed in this session on 2026-09-25 with three throw-away Node scripts
+  (Node v22.23.2, Linux x86-64, glibc) against the packages =npm install= put in
+  =node_modules=: =level@10.0.0=, =classic-level@3.0.0=, =abstract-level@3.1.1=,
+  =memory-level@3.1.0=, =level-transcoder@1.0.1=, =level-supports@6.2.0=. Every =[LIVE]=
+  fact was checked on BOTH =memory-level= and =classic-level= (through =level=) unless
+  the text says otherwise. Temporary on-disk databases lived under the job's tmp dir and
+  were destroyed afterwards. Nothing touched the network except =npm install=.
+- =[SRC]= — read from the installed package sources (=abstract-level/lib/*.js=,
+  =classic-level/binding.gyp=, =classic-level/deps/=).
+Anything not covered by these tags is in section 9 "Uncertain / needs verification".
+
+** Reading conventions
+- "abstract-level" is the interface; "classic-level" the LevelDB binding that
+  implements it; "level" the convenience package that re-exports classic-level in
+  Node.js. "db" below means any of them unless stated.
+- Upstream names are given verbatim (camelCase JS: =keyEncoding=, =highWaterMarkBytes=);
+  the kebab-case translation lives in section 10.1.
+- "Scope" column values: =core= (the library implements it in Phase 2), =iter= (Phase 3,
+  core.async), =admin= (Phase 4, classic-level extras), =none= (inventoried, deliberately
+  not exposed), =later= (possible follow-up).
+- "Deferred" means the call may be made while =db.status= is ='opening'= and is queued
+  until open completes (or rejects if opening failed).
+- Sizes are bytes; =limit= is an entry count; =Infinity= / =-1= mean "no limit".
+
+* 0. Coverage checklist
+| #  | Area                                                             | Status   | Section |
+|----+------------------------------------------------------------------+----------+---------|
+| 1  | Package choice, versions, engine, native build, test backend    | complete | 1       |
+| 2  | API census (constructor, lifecycle, reads, writes, iterators, clear, sublevels, snapshots, events, supports, classic-level extras) | complete | 2 |
+| 3  | Error taxonomy and mapping                                       | complete | 3       |
+| 4  | Encodings                                                        | complete | 4       |
+| 5  | Iterator / chained-batch / snapshot subtleties                   | complete | 5       |
+| 6  | Events and hooks                                                 | complete | 6       |
+| 7  | Process / filesystem facts                                       | complete | 7       |
+| 8  | Pitfalls checklist                                               | complete | 8       |
+| 9  | Uncertain / needs verification (numbered, with house positions)  | complete | 9       |
+| 10 | Implementation notes for leveldb-cljs                            | complete | 10      |
+| 11 | Phase 2 implementation outline (namespaces + public fns)         | complete | 11      |
+| 12 | Sources                                                          | complete | 12      |
+
+* 1. Package choice and platform
+** 1.1 What =level= is today [NPM][README level][UPGRADING level][CHANGELOG level]
+- =level@10.0.0= is =latest= (published 2025-04-20); dist-tag =next= is a stale
+  =5.0.0-0=. There is no 8.x or 9.x =latest=; the task's expectation of "v8.x" is
+  three majors old (uncertainty 9.1).
+- =level= is a convenience package: in Node.js =index.js= is one line,
+  =exports.Level = require('classic-level').ClassicLevel= [SRC]; the =browser= field
+  points to =browser-level= (IndexedDB). =[LIVE]= =Level === ClassicLevel= is =true=.
+- History that matters for old blog posts and AI-era snippets:
+| level | date       | change [UPGRADING level]                                                                         |
+|-------+------------+--------------------------------------------------------------------------------------------------|
+| 7.x   | 2021       | =levelup= + =encoding-down= + =leveldown= onion; =level('path')= factory; callbacks; =NotFoundError= |
+| 8.0.0 | 2022-03-25 | switched to =classic-level= / =browser-level= on =abstract-level@1=; =new Level()=; sublevels built in; ='view'= encoding; streams moved to =level-read-stream=; error =code= properties; zero-length keys valid |
+| 9.0.0 | 2024-12-01 | =abstract-level@2=: callbacks REMOVED, =get()= yields =undefined= instead of a not-found error, hooks added, Node ≥ 18 |
+| 10.0.0| 2025-04-20 | =abstract-level@3=: explicit snapshots, =has()= / =hasMany()=, =getSync()=, =Symbol.asyncDispose=; =put= / =del= / =batch= events removed in favour of =write= |
+- =levelup@5.1.1=, =leveldown@6.1.1=, =memdown@6.1.1= are all marked deprecated on npm
+  ("Superseded by abstract-level / classic-level / memory-level") [NPM].
+- Runtime dependency tree of =level@10.0.0= [NPM][LIVE npm ls]: =classic-level@3.0.0=,
+  =browser-level@3.0.0= (unused in Node but installed), =abstract-level@3.1.1=
+  (→ =level-supports@6.2.0=, =level-transcoder@1.0.1=, =module-error=, =buffer=,
+  =is-buffer=, =maybe-combine-errors=). =classic-level= adds =napi-macros= and
+  =node-gyp-build=. 141 packages total after =npm install= including shadow-cljs [LIVE].
+- Decision: depend on =level@^10= (not =classic-level= directly) so the name matches the
+  ecosystem docs and a browser build stays theoretically possible; the binding namespace
+  requires ="level"= and uses the =Level= named export. Uncertainty 9.1 records the
+  alternative.
+
+** 1.2 Engines, platforms, licence [NPM][README classic-level][README level]
+- =engines.node: ">=18"= on =level=, =classic-level=, =abstract-level=, =memory-level=.
+  Electron ≥ 30. This session ran Node 22.23.2. abstract-level needs =queueMicrotask=,
+  =Promise.allSettled=, =globalThis=, async generators.
+- Licence MIT on all four packages.
+- Platforms: Linux (incl. ARM, Alpine/musl, old glibc 2.28), macOS ≥ 10.7 (x64+arm64
+  fat binary), Windows (x64, ia32), Android — all via prebuilt binaries.
+- "Binary keys and values are supported across the board." [README level]
+
+** 1.3 Native binary [README classic-level][SRC][LIVE]
+- =classic-level= is a Node-API (N-API) addon (=binding.gyp=, =gypfile: true=). Its
+  =install= script is =node-gyp-build=: it loads a matching prebuilt binary from
+  =prebuilds/<platform>-<arch>/= and only falls back to compiling from source
+  (requiring a working =node-gyp= toolchain: Python, C++ compiler, headers) when no
+  prebuild matches. =npm install classic-level --build-from-source= forces a compile.
+- =[LIVE]= shipped prebuild dirs: =android-arm=, =android-arm64=, =darwin-x64+arm64=,
+  =linux-arm=, =linux-arm64=, =linux-x64= (=classic-level.node= + =classic-level.musl.node=,
+  952 KB together), =win32-ia32=, =win32-x64=. On this machine =npm install= took ~3 s,
+  created no =build/= directory and printed no compiler output: the prebuilt glibc
+  binary was used. Prebuilds are built against Node headers 18.20.4 with =--napi=
+  [SRC package.json scripts], so any Node ≥ 18 loads them.
+- Bundled C++: LevelDB =1.20= (=deps/leveldb/leveldb-1.20=, =kMajorVersion 1=,
+  =kMinorVersion 20=, one patch =001-value-sink.patch=) and Snappy (=deps/snappy/snappy=,
+  version not pinned in a header; CMake-templated) [SRC]. Snappy compression is on by
+  default (=compression: true=).
+- Exclusive lock: opening a location already open in another process or instance fails
+  with =LEVEL_LOCKED= (as the =cause= of a =LEVEL_DATABASE_NOT_OPEN=; section 3.4) [LIVE].
+- Fallback if the native module cannot load: none inside =level=. Options are
+  =memory-level= (no persistence) or =browser-level= (IndexedDB, browsers only). See
+  pitfall 8.20 and uncertainty 9.10.
+
+** 1.4 In-memory backend for tests [NPM][README memory-level][UPGRADING memory-level][LIVE]
+| Package         | Version | State                                                                 |
+|-----------------+---------+-----------------------------------------------------------------------|
+| =memory-level=  | 3.1.0 (2025-04-20) | current; abstract-level@3; explicit snapshots, has, getSync |
+| =memdown=       | 6.1.1   | DEPRECATED: "Superseded by memory-level"                              |
+| =memorydown=    | —       | does not exist on npm (404)                                           |
+| =level-mem=     | —       | legacy =levelup= bundle, superseded by memory-level                   |
+- =memory-level= is a fully persistent red-black tree (=functional-red-black-tree=),
+  implements =abstract-level= with one extra constructor option =storeEncoding=
+  (='buffer'= default, ='view'=, ='utf8'=). =createIfMissing= / =errorIfExists= are
+  not supported (=db.supports.createIfMissing = false=). Data is discarded when the
+  object is garbage collected; =close()= / reopen keep the data. Stored Buffers are not
+  copied (mutation leaks into the store).
+- Differences from classic-level that tests must not depend on [LIVE]: =supports=
+  differences (section 2.10); =db.keyEncoding('view').name= is ='view+buffer'= on
+  memory-level but ='view'= on classic-level (transcoding); =write= event
+  =encodedKey= / =encodedValue= are Buffers on memory-level and strings on
+  classic-level; =signals.iterators= false vs true; no =approximateSize= /
+  =compactRange= / =getProperty= / =location=; =storeEncoding: 'utf8'= makes ='view'=
+  fail with =LEVEL_ENCODING_NOT_SUPPORTED=.
+- Recommendation: =memory-level@^3.1.0= as a devDependency (already in package.json).
+  The binding namespace takes the constructor as an injectable so tests build clients
+  on =MemoryLevel= with default =storeEncoding= (buffer, non-destructive); Phase 5
+  smoke runs the same suite against a temp on-disk =Level= and =destroy=s it.
+
+** 1.5 Ecosystem, for orientation only (not dependencies) [NPM][README community]
+| Package                         | Version | Role                                                    | leveldb-cljs |
+|---------------------------------+---------+---------------------------------------------------------+--------------|
+| =level-read-stream=             | 2.0.0   | Node readable streams over iterators (=EntryStream= etc.) | none: core.async instead (Phase 3) |
+| =level-web-stream=              | 1.1.0   | WHATWG streams over iterators                            | none |
+| =browser-level=                 | 3.0.0   | IndexedDB backend (what =level= exports in browsers)    | none (Node only) |
+| =many-level= / =rave-level=     | 2.0.0 / 1.0.0 | multi-process sharing over a socket                | none (uncertainty 9.8) |
+| =charwise= / =lexicographic-integer-encoding= | 3.0.1 / 1.0.1 | order-preserving key encodings (level-codec interface) | later; custom encoding objects are accepted (4.3) |
+| =level-transcoder=              | 1.0.1   | the encoding engine inside abstract-level               | transitive |
+| =level-supports=                | 6.2.0   | =db.supports= manifest                                   | transitive |
+
+* 2. API census (abstract-level surface as implemented by classic-level 3 / memory-level 3)
+** 2.1 Constructor [README abstract-level][README classic-level][README level]
+=db = new Level(location[, options])= — =location= is a directory path (relative or
+absolute), created *recursively* if missing (=[LIVE]= =new Level('x/a/b')= created
+=x/a/b/CURRENT=). =new MemoryLevel([options])= has no location. =new= is required.
+Constructor options:
+| Option           | Type / default                 | Notes                                                                 |
+|------------------+--------------------------------+-----------------------------------------------------------------------|
+| =keyEncoding=    | string or object, ='utf8'=     | default encoding for keys (section 4)                                 |
+| =valueEncoding=  | string or object, ='utf8'=     | default encoding for values                                            |
+| =passive=        | boolean, false                 | only meaningful on =open()=; NOT forwarded from the constructor        |
+| any =open()= option | see 2.2                      | forwarded to the automatic =open()=; =open(opts)= shallow-merges over them [UPGRADING classic-level] |
+The constructor returns synchronously with =status = 'opening'= and calls =open()= in
+a following tick [LIVE]. There is no constructor callback.
+
+** 2.2 Lifecycle [README abstract-level][LIVE]
+| Member                | Returns          | Semantics                                                                                                  |
+|-----------------------+------------------+------------------------------------------------------------------------------------------------------------|
+| =db.status=           | string           | ='opening'= → ='open'= → ='closing'= → ='closed'= (=[LIVE]= all four observed; a failed open ends in ='closed'=) |
+| =db.open([options])=  | Promise<void>    | idempotent; resolves immediately if open, waits if opening, reopens after close; options override constructor options |
+| =db.close()=          | Promise<void>    | idempotent; closes every unclosed iterator, chained batch, snapshot and sublevel; classic-level additionally waits for in-flight operations (=[LIVE]= a pending =put= resolved before =close= resolved) |
+| deferred open         | —                | any read/write made while ='opening'= is queued and runs after open; =[LIVE]= =get= before open resolved =undefined=; =put= issued while ='opening'= resolved after status became ='open'=; if opening FAILS the queued ops reject with =LEVEL_DATABASE_NOT_OPEN= and — =[LIVE]= — a =null= =cause= (only the =open()= promise itself carries the cause, 3.4) |
+| =open()= options      |                  | =createIfMissing= (true), =errorIfExists= (false), =passive= (false: wait for but do not initiate opening; =[LIVE]= on a closed db =open({passive:true})= rejects =LEVEL_DATABASE_NOT_OPEN= "Database failed to open") + classic-level tuning options (2.11) |
+| =db.defer(fn)= / =db.deferAsync(fn)= | — / Promise | plugin hooks for deferring custom methods; take =signal=; scope none |
+| =db.attachResource(r)= / =detachResource(r)= | — | track custom closeables; scope none |
+| =db[Symbol.asyncDispose]= | function      | =[LIVE]= present (TypeScript =await using=); scope none |
+=[LIVE]= closing the parent closes its sublevels (=sub.status= → ='closed'=) and
+REOPENING THE PARENT DOES NOT REOPEN THEM: an existing sublevel handle stays ='closed'=
+and its =get= rejects =LEVEL_DATABASE_NOT_OPEN=, while a fresh =db.sublevel('s')=
+handle reads the data fine (both backends). See pitfall 8.14 and 9.13.
+
+** 2.3 Reads [README abstract-level][README classic-level][LIVE]
+| Method                        | Returns                                   | Options                                              | Not found                          | Scope |
+|-------------------------------+-------------------------------------------+------------------------------------------------------+------------------------------------+-------|
+| =db.get(key[, o])=            | Promise<value \vert undefined>            | =keyEncoding=, =valueEncoding=, =snapshot=, classic: =fillCache= | resolves =undefined= (=[LIVE]=; NO error since v9) | core |
+| =db.getSync(key[, o])=        | value \vert undefined (synchronous)       | same                                                 | =undefined=                        | later (uncertainty 9.15) |
+| =db.getMany(keys[, o])=       | Promise<Array<value \vert undefined>>     | same                                                 | =undefined= at that index (=[LIVE]= =typeof= is ='undefined'=) | core |
+| =db.has(key[, o])=            | Promise<boolean>                          | =keyEncoding=, =snapshot=                            | =false=                            | core |
+| =db.hasMany(keys[, o])=       | Promise<boolean[]>                        | same                                                 | =false= at that index              | core |
+Reads on classic-level take an implicit snapshot synchronously at call time (2.8/5.7).
+=getSync= blocks the event loop; classic-level and memory-level both implement it
+(=db.supports.getSync = true= [LIVE]).
+
+** 2.4 Writes [README abstract-level][README classic-level][LIVE]
+| Method                                   | Returns        | Options                                                       | Scope |
+|------------------------------------------+----------------+---------------------------------------------------------------+-------|
+| =db.put(key, value[, o])=                | Promise<void>  | =keyEncoding=, =valueEncoding=, classic: =sync= (fsync, default false); unknown option keys are carried into the =write= event op (=[LIVE]= =foo: true= appeared on the op) | core |
+| =db.del(key[, o])=                       | Promise<void>  | =keyEncoding=, classic: =sync=; =[LIVE]= deleting a missing key resolves | core |
+| =db.batch(ops[, o])=                     | Promise<void>  | ops: ={type:'put',key,value[,keyEncoding][,valueEncoding][,sublevel]}= / ={type:'del',key[,keyEncoding][,sublevel]}=; batch-level =keyEncoding= / =valueEncoding= defaults; classic: =sync=. Atomic. =[LIVE]= per-op =valueEncoding: 'json'= honoured; empty array resolves (fast path); a bad =type= rejects with a plain =TypeError= (no =code=) | core |
+| =db.batch()= (no args)                   | chainedBatch   | see 2.5; synchronous; database must be ='open'= (=[LIVE]= on a fresh ='opening'= db it THROWS =LEVEL_DATABASE_NOT_OPEN= synchronously) | core |
+| =chainedBatch.put(k, v[, o])= / =.del(k[, o])= | chainedBatch (chainable) | =keyEncoding=, =valueEncoding=, =sublevel=; validation is synchronous (=[LIVE]= =put(null, ..)= throws =LEVEL_INVALID_KEY=) | core |
+| =chainedBatch.clear()=                   | —              | drop queued ops (=[LIVE]= =length= → 0, nothing written)     | core |
+| =chainedBatch.write([o])=                | Promise<void>  | atomic commit; auto-closes; classic: =sync=; no encoding options here | core |
+| =chainedBatch.close()=                   | Promise<void>  | discard without writing; idempotent                           | core |
+| =chainedBatch.length= / =.db=            | number / db    | =[LIVE]= =length= counted 2 after =put= + =del=               | core |
+The =sublevel= op property must reference a sublevel of the *same root* (README);
+=[LIVE]= NEITHER backend rejected a sublevel of a different root — the op resolved and
+the entry was readable in none of the three places checked (this root, the foreign
+sublevel, the foreign root): silent data loss (uncertainty 9.2).
+
+** 2.5 Iterators [README abstract-level][README classic-level][LIVE]
+Factories: =db.iterator([o])= → entries =[key, value]=; =db.keys([o])= → keys;
+=db.values([o])= → values. All three are synchronous constructors (no promise) and
+may be called while ='opening'= (=[LIVE]= an iterator created while opening yielded
+normally after open) but THROW =LEVEL_DATABASE_NOT_OPEN= synchronously once the db is
+closed [LIVE].
+Options:
+| Option              | Applies to                | Semantics [LIVE where marked]                                                                  |
+|---------------------+---------------------------+------------------------------------------------------------------------------------------------|
+| =gt= / =gte=        | all                       | lower bound; =gte= wins over =gt= when both given (=[LIVE]= ={gte:'b',gt:'a'}= → from ='b'=)  |
+| =lt= / =lte=        | all                       | upper bound; =lte= wins over =lt=                                                              |
+| =reverse=           | all                       | default false; same set of entries, reversed                                                    |
+| =limit=             | all                       | default =Infinity=; =-1= also means no limit; =[LIVE]= =0= yields NOTHING; =iterator.limit= reports =0= / =Infinity= / =n=; with =reverse= the highest keys are taken |
+| =keys= / =values=   | =iterator()= only         | default true; =false= yields =undefined= in that slot (=[LIVE]= =[undefined,'empty']=); prefer =keys()= / =values()= |
+| =keyEncoding=       | all (incl. =values()=)    | encodes range options and =seek= targets, decodes keys                                          |
+| =valueEncoding=     | =iterator()=, =values()=  | decodes values                                                                                   |
+| =snapshot=          | all                       | explicit snapshot to read from (2.8)                                                            |
+| =signal=            | all                       | =AbortSignal=, experimental; classic-level yes, memory-level no (=supports.signals.iterators=); =[LIVE]= pre-aborted signal → =LEVEL_ABORTED= with =name 'AbortError'= on both (memory-level honours it despite the manifest) |
+| =fillCache=         | classic-level             | default true                                                                                    |
+| =highWaterMarkBytes=| classic-level             | default 16 KiB; caps bytes read per =nextv= / internal =next= cache; =[LIVE]= =0= makes =nextv(10)= return 1 entry; cannot be =Infinity= |
+| unknown keys        | all                       | =[LIVE]= silently ignored (=bogus: 1=)                                                            |
+Methods:
+| Member                        | Returns                          | Semantics                                                                                                |
+|-------------------------------+----------------------------------+----------------------------------------------------------------------------------------------------------|
+| =for await (x of it)=         | async iteration                  | closes the iterator on finish / break / throw                                                            |
+| =it.next()=                   | Promise<entry \vert undefined>   | =undefined= at natural end; =[LIVE]= after natural end a =seek= back into range makes =next= yield again |
+| =it.nextv(size[, o])=         | Promise<entry[]>                 | =[]= at natural end; =[LIVE]= =nextv(2)= ×3 over 6 entries → 2,2,2                                       |
+| =it.all([o])=                 | Promise<entry[]>                 | remaining entries; auto-closes                                                                          |
+| =it.seek(target[, o])=        | void (synchronous)               | next read yields keys ≥ target (≤ when =reverse=); out of the range options → natural end (=[LIVE]= =seek('zzz')= then =next= → =undefined=); option =keyEncoding= |
+| =it.close()=                  | Promise<void>                    | idempotent (=[LIVE]= closed twice); waits for an in-flight read; after it, reads reject =LEVEL_ITERATOR_NOT_OPEN= |
+| =it.count= / =it.limit= / =it.db= | number / number / db         | entries yielded so far (=[LIVE]= 2 after two =next=) / =Infinity= or the option / owner                  |
+Concurrency: any number of iterators may coexist (=[LIVE]= forward + reverse
+concurrently) but one iterator allows ONE read in flight; a second =next= / =nextv= /
+=all= while one is pending fails with =LEVEL_ITERATOR_BUSY= — =[LIVE]= as a REJECTED
+PROMISE, not the synchronous throw the README example suggests (uncertainty 9.3).
+
+** 2.6 =db.clear([options])= [README abstract-level][LIVE]
+Deletes all entries or a range. Options: =gt= / =gte= / =lt= / =lte=, =reverse= (only
+meaningful with =limit=: delete the LAST n), =limit=, =keyEncoding=, =snapshot=. Not
+guaranteed atomic. Returns Promise<void>; emits =clear= with the verbatim options
+object. =[LIVE]= ={gte:'x',lt:'y',limit:1,reverse:true}= removed only =x3=; on a sublevel
+with no options it cleared only that sublevel's keys. Scope core.
+
+** 2.7 Sublevels [README abstract-level][LIVE]
+=sub = db.sublevel(name[, options])= — =name= is a string or an array of strings
+(array = nested prefix with =db= as direct parent, skipping intermediate sublevels).
+Options: =separator= (default ='!'=; must sort before the bytes used in names),
+=keyEncoding= / =valueEncoding= (default ='utf8'= REGARDLESS of the parent's
+encodings). A sublevel is a full =AbstractLevel= with its own encodings, events, hooks,
+status; it opens itself (waiting for the parent if that is opening), and is closed when
+the parent closes.
+| Fact                                                | Evidence                                                                              |
+|-----------------------------------------------------+---------------------------------------------------------------------------------------|
+| prefix = =separator + name + separator=             | =[LIVE]= ='!people!'=; separator ='#'= → ='#sep#'=; empty name → ='!!'=               |
+| nested prefix concatenates                          | =[LIVE]= ='!people!!nested!'= for both =sub.sublevel('nested')= and =db.sublevel(['people','nested'])= |
+| =sub.prefix=, =sub.parent=, =sub.db= (root), =sub.path([local])= | =[LIVE]= =path()= → =['people','nested']=, =path(true)= → =['nested']=; array-form parent is =db= |
+| name bytes must be > 34 and < 127 (printable ASCII above ="=) | =[LIVE]= ='héllo'= and ='a!b'= with separator ='!'= → =LEVEL_INVALID_PREFIX= "Sublevel name must use bytes > 34 < 127" |
+| user keys may contain the separator                 | =[LIVE]= key ='x!y'= stored as ='!s2!x!y'=, readable through the sublevel              |
+| parent sees prefixed keys and raw (undecoded) values | =[LIVE]= =db.get('!people!alice')= on a utf8 parent returned the JSON string; the parent with =valueEncoding: 'json'= would decode |
+| range options are prefixed                          | =[LIVE]= =sub.keys({gt:'a'})= → =['b']= only                                          |
+| =batch= / chained batch ops accept =sublevel=       | =[LIVE]= put through the root with =sublevel: people= was encoded with the sublevel's json encoding |
+| storage layout compatible with old =subleveldown=    | README                                                                                |
+Scope core (Phase 2): =sublevel= returns another client value sharing the binding.
+
+** 2.8 Snapshots [README abstract-level][UPGRADING abstract-level 3][LIVE]
+- Implicit: on classic-level and memory-level every =get= / =getMany= / =has= / iterator
+  reads from a snapshot taken synchronously at call time (=supports.implicitSnapshots=,
+  alias =snapshots=). =[LIVE]= an iterator created before a =put= still yielded the old
+  value. A write that has not yet RESOLVED may or may not be visible to a subsequent
+  read; once resolved it is.
+- Explicit: =snapshot = db.snapshot()= (synchronous; throws =LEVEL_NOT_SUPPORTED= where
+  =supports.explicitSnapshots= is false), passed as the =snapshot= option to =get=,
+  =getMany=, =has=, =hasMany=, =iterator= / =keys= / =values=, =clear=; also works on
+  sublevels. =snapshot.close()= (Promise, idempotent) must be called; afterwards use
+  rejects =LEVEL_SNAPSHOT_NOT_OPEN= [LIVE]. =snapshot.ref()= / =unref()= exist for
+  plugins. =[LIVE]= both backends report =explicitSnapshots: true= (the level-supports
+  README table still says "Not yet" — stale, uncertainty 9.17). Scope core (Phase 2/3).
+
+** 2.9 Events and hooks — summary (details in section 6)
+Events: =opening=, =open=, =closing=, =closed= (no args), =write= (array of normalized
+ops), =clear= (options). =put= / =del= / =batch= are GONE in abstract-level 3: adding
+such a listener prints one =console.warn= of a =LEVEL_LEGACY= ModuleError and the
+listener never fires [LIVE][SRC lib/event-monitor.js]. Hooks: =db.hooks.prewrite=,
+=postopen=, =newsub= [LIVE keys] — experimental, scope none.
+
+** 2.10 =db.supports= manifest [README level-supports][LIVE]
+Truthy properties (check with =if (db.supports.x)=, never ==== true=). Observed:
+| Property             | classic-level 3.0.0                         | memory-level 3.1.0 |
+|----------------------+---------------------------------------------+--------------------|
+| =permanence=         | true                                        | false              |
+| =seek=               | true                                        | true               |
+| =deferredOpen=       | true                                        | true               |
+| =createIfMissing= / =errorIfExists= | true / true                 | false / false      |
+| =implicitSnapshots= (alias =snapshots=) | true                     | true               |
+| =explicitSnapshots=  | true                                        | true               |
+| =has=                | true                                        | true               |
+| =getSync=            | true                                        | true               |
+| =streams=            | false                                       | false              |
+| =encodings=          | buffer, utf8, view, json, hex, base64 (all true; custom encodings are added when first normalized by name) | same |
+| =events=             | opening, open, closing, closed, write, clear | same              |
+| =signals=            | ={iterators: true}=                         | ={iterators: false}= |
+| =additionalMethods=  | ={approximateSize: true, compactRange: true}= | ={}=             |
+=[LIVE]= a custom encoding passed only per-call did NOT appear in
+=supports.encodings= (=upper: false=) though it was usable by name afterwards (4.3).
+The library exposes the manifest as a kebab map (=:implicit-snapshots= …) via =supports=.
+
+** 2.11 classic-level extras [README classic-level][LIVE]
+| Member                                   | Returns                 | Notes                                                                                     | Scope |
+|------------------------------------------+-------------------------+-------------------------------------------------------------------------------------------+-------|
+| =db.location=                            | string                  | as passed to the constructor                                                              | core  |
+| =db.approximateSize(start, end[, o])=    | Promise<number>         | bytes of =[start, end)=; may exclude recent writes (=[LIVE]= 543 for ~15 tiny entries); option =keyEncoding= | admin |
+| =db.compactRange(start, end[, o])=       | Promise<void>           | =[start, end]=; option =keyEncoding=                                                      | admin |
+| =db.getProperty(prop)=                   | string (sync)           | ='leveldb.stats'=, ='leveldb.sstables'=, ='leveldb.num-files-at-levelN'= (=[LIVE]= level0 → ='0'=) | admin |
+| =ClassicLevel.destroy(location)=         | Promise<void>           | static; removes LevelDB files (and the dir if nothing else is in it); close first; =[LIVE]= dir gone; =Level.destroy= is the same function | admin |
+| =ClassicLevel.repair(location)=          | Promise<void>           | static; close first; =[LIVE]= on a missing location it resolved (and created the dir)     | admin |
+| open options: =multithreading= (false), =compression= (true), =cacheSize= (8 MiB), =writeBufferSize= (4 MiB), =blockSize= (4096), =maxOpenFiles= (1000), =blockRestartInterval= (16), =maxFileSize= (2 MiB) | | forwarded from the constructor | core (passed through as kebab keys) |
+| read option =fillCache=, write option =sync=, iterator option =highWaterMarkBytes= | | =[LIVE]= accepted | core |
+
+** 2.12 Method census (scope decisions)
+| Upstream                                  | Kind        | Deferred | Scope | leveldb-cljs (section 11)              |
+|-------------------------------------------+-------------+----------+-------+----------------------------------------|
+| =new Level(loc, o)= / =new MemoryLevel(o)= | ctor        | —        | core  | =core/open!= (returns after =open()=)  |
+| =open= / =close= / =status=               | lifecycle   | —        | core  | =core/open!=, =core/close!=, =core/status= |
+| =get= / =getMany= / =has= / =hasMany=     | read        | yes      | core  | =core/get!=, =get-many!=, =has?!=, =has-many!= |
+| =getSync=                                 | read (sync) | no       | later | uncertainty 9.15                       |
+| =put= / =del= / =batch(ops)=              | write       | yes      | core  | =core/put!=, =del!=, =batch!=          |
+| =batch()= chained                         | write       | NO       | core  | =batch/chained=, =batch/put=, =del=, =clear=, =write!=, =close!= |
+| =iterator= / =keys= / =values=            | read        | yes      | iter  | =iter/entries=, =iter/keys=, =iter/values= (channels) + =core/all!= style helpers |
+| =clear=                                   | write       | yes      | core  | =core/clear!=                          |
+| =sublevel=                                | structure   | —        | core  | =core/sublevel=                        |
+| =snapshot= + =snapshot.close=             | read        | no       | core  | =core/snapshot=, =core/close-snapshot!= |
+| events                                    | evented     | —        | iter  | =iter/events= (channel) — Phase 3/4    |
+| =keyEncoding()= / =valueEncoding()= / =prefixKey= | encoding | —      | none  | codec descriptors are CLJS keywords (4.7) |
+| =supports=                                | manifest    | —        | core  | =core/supports=                        |
+| hooks, =defer=, =attachResource=, =Symbol.asyncDispose= | plugin | — | none |                                        |
+| =approximateSize= / =compactRange= / =getProperty= / =destroy= / =repair= / =location= | classic | mixed | admin | =admin/…= (Phase 4) |
+
+* 3. Error taxonomy
+** 3.1 Shape [README abstract-level][UPGRADING abstract-level 1 §6][LIVE]
+- Errors are instances of =ModuleError= (package =module-error=): =name= is ='Error'=
+  (=[LIVE]= — not ='ModuleError'=), =constructor.name= is ='ModuleError'=, =code= is an
+  uppercase string, =message= is free text that may change between minor versions,
+  optional =cause=. Codes are the semver contract; messages are not.
+- Abort: =name 'AbortError'=, =code 'LEVEL_ABORTED'= [LIVE].
+- Failed open: =constructor.name 'NotOpenError'=, =code 'LEVEL_DATABASE_NOT_OPEN'=,
+  message "Database failed to open", =cause= = the underlying error (3.4) [LIVE].
+- Programming mistakes raise plain =TypeError= without =code= (=[LIVE]= bad batch op
+  type: "A batch operation must have a type property that is 'put' or 'del'").
+- No =NotFoundError=, no =err.notFound=, no =LEVEL_NOT_FOUND= since abstract-level 2 /
+  level 9: =get= resolves =undefined= [UPGRADING abstract-level 2 §1.2][LIVE]. The
+  =notFound= / =status= properties mentioned in the level@8 era are gone.
+- The old =level-errors= classes (=InitializationError=, =OpenError=, =ReadError=,
+  =WriteError=, =NotFoundError=, =EncodingError=) do not exist in this stack; they map
+  onto the codes below (=OpenError= → =LEVEL_DATABASE_NOT_OPEN= with cause,
+  =EncodingError= → =LEVEL_DECODE_ERROR= / =LEVEL_ENCODING_NOT_FOUND=, etc.).
+
+** 3.2 Codes [README abstract-level §Errors][LIVE where marked]
+| Code                            | When                                                                                   | Sync/async (3.3) | leveldb-cljs =:code= |
+|---------------------------------+----------------------------------------------------------------------------------------+------------------+----------------------|
+| =LEVEL_DATABASE_NOT_OPEN=       | op while closing/closed; failed open (=cause=); chained =batch()= while opening =[LIVE]= | both           | =:database-not-open= |
+| =LEVEL_DATABASE_NOT_CLOSED=     | =close()= failed (=cause=)                                                              | async            | =:database-not-closed= |
+| =LEVEL_ITERATOR_NOT_OPEN=       | read on a closed iterator =[LIVE]=                                                     | async            | =:iterator-not-open= |
+| =LEVEL_ITERATOR_BUSY=           | second read while one in flight =[LIVE]=                                               | async (rejection)| =:iterator-busy=     |
+| =LEVEL_BATCH_NOT_OPEN=          | op on a chained batch after =write()= / =close()= =[LIVE]=                            | sync throw       | =:batch-not-open=    |
+| =LEVEL_SNAPSHOT_NOT_OPEN=       | =snapshot= option after =snapshot.close()= =[LIVE]=                                    | async            | =:snapshot-not-open= |
+| =LEVEL_ABORTED=                 | signal aborted =[LIVE]= (=name 'AbortError'=)                                          | async            | =:aborted=           |
+| =LEVEL_ENCODING_NOT_FOUND=      | unknown encoding name =[LIVE]=                                                         | async (per op)   | =:encoding-not-found= |
+| =LEVEL_ENCODING_NOT_SUPPORTED=  | encoding cannot be transcoded to the store format =[LIVE]= (memory-level =storeEncoding 'utf8'= + ='view'=) | sync from =keyEncoding()= | =:encoding-not-supported= |
+| =LEVEL_DECODE_ERROR=            | decode failed; =cause= is the original (=[LIVE]= =SyntaxError= from =JSON.parse=)     | async            | =:decode-error=      |
+| =LEVEL_INVALID_KEY=             | key =null= / =undefined= =[LIVE]= (message "Key cannot be null or undefined")         | async on =put=; sync on chained =put= | =:invalid-key= |
+| =LEVEL_INVALID_VALUE=           | value =null= / =undefined= =[LIVE]=                                                    | same             | =:invalid-value=     |
+| =LEVEL_CORRUPTION=              | LevelDB corruption                                                                     | async            | =:corruption=        |
+| =LEVEL_IO_ERROR=                | filesystem I/O error                                                                   | async            | =:io-error=          |
+| =LEVEL_INVALID_PREFIX=          | sublevel name/separator bytes out of range =[LIVE]=                                    | sync throw       | =:invalid-prefix=    |
+| =LEVEL_NOT_SUPPORTED=           | feature absent per =supports= (e.g. =snapshot()= on browser-level)                    | sync             | =:not-supported=     |
+| =LEVEL_LEGACY=                  | removed API used; =[LIVE]= only =console.warn=-ed for legacy events, not thrown        | warn             | =:legacy=            |
+| =LEVEL_LOCKED=                  | location held by another process/instance =[LIVE]= (as =cause=; message "IO error: lock …/LOCK: already held by process") | cause | =:locked= |
+| =LEVEL_HOOK_ERROR=              | hook function threw (=cause=)                                                          | async            | =:hook-error=        |
+| =LEVEL_STATUS_LOCKED=           | =open= / =close= during a =postopen= hook lock                                         | async            | =:status-locked=     |
+| =LEVEL_READONLY= / =LEVEL_CONNECTION_LOST= / =LEVEL_REMOTE_ERROR= | many-level only                                        | —                | pass through         |
+Translation rule (=util/level-code->keyword=): strip =LEVEL_=, lower-case, =_= → =-=.
+
+** 3.3 Synchronous throw vs promise rejection [LIVE]
+| Call                                              | Delivery                                                        |
+|---------------------------------------------------+-----------------------------------------------------------------|
+| =db.iterator()= / =keys()= / =values()= on a closed db | synchronous throw                                          |
+| =db.batch()= (chained) while not open             | synchronous throw                                               |
+| =chainedBatch.put/del= invalid key/value or after write | synchronous throw                                         |
+| =db.sublevel()= bad name/separator                | synchronous throw                                               |
+| =db.keyEncoding(x)= unsupported                   | synchronous throw                                               |
+| =db.snapshot()= unsupported                       | synchronous throw                                               |
+| =it.seek()= while a read is in flight             | synchronous throw (=LEVEL_ITERATOR_BUSY=) =[LIVE]=              |
+| =it.next/nextv/all= busy or closed                | promise rejection (README shows =try/catch= around =all()= — that only works because the rejection is unhandled; treat as async) |
+| every other method                                | promise rejection                                               |
+The binding namespace must wrap synchronous calls in =try= and convert throws into
+rejected promesa promises so callers see ONE delivery mechanism (10.5).
+
+** 3.4 Failed-open shapes [LIVE classic-level]
+| Situation                                      | =code=                   | =cause.code=   | =cause.message=                                                               |
+|------------------------------------------------+--------------------------+----------------+-------------------------------------------------------------------------------|
+| location locked by another instance            | =LEVEL_DATABASE_NOT_OPEN= | =LEVEL_LOCKED= | "IO error: lock <loc>/LOCK: already held by process"                         |
+| =createIfMissing: false=, location missing     | =LEVEL_DATABASE_NOT_OPEN= | (none)         | "Invalid argument: <loc>: does not exist (create_if_missing is false)"        |
+| =errorIfExists: true=, location exists         | =LEVEL_DATABASE_NOT_OPEN= | (none)         | "Invalid argument: <loc>: exists (error_if_exists is true)"                   |
+| deferred op after a failed open                | =LEVEL_DATABASE_NOT_OPEN= | =cause= is =null= | "Database is not open"                                                      |
+Only =LEVEL_LOCKED= carries a code; the other causes are message-only (uncertainty 9.4).
+
+** 3.5 Mapping to the leveldb-cljs error design (implemented in =util= for Phase 0)
+| leveldb-cljs =:type=            | Source                                                                          | Data keys                                              |
+|---------------------------------+---------------------------------------------------------------------------------+--------------------------------------------------------|
+| =:leveldb-cljs/db-error=        | any error thrown/rejected by the binding                                        | =:code= (kebab keyword or nil), =:message=, =:cause= (original JS error, opaque), =:cause-code=, =:cause-message=, =:name=, =:op= (=:get= …), =:location= |
+| =:leveldb-cljs/argument-error=  | validation BEFORE calling upstream (nil key, bad range map, unknown codec keyword, sublevel of another root, non-string name) | =:arg=, =:value= |
+| =:leveldb-cljs/codec-error=     | encode/decode failure inside a library-side codec (=:edn=)                     | =:codec=, =:direction=, =:cause=                        |
+Detection helpers: =error-data=, =error-type=, =error-code=, =not-open?=. A
+=TypeError= without =code= becomes a db-error with =:code nil= and =:name "TypeError"=.
+
+* 4. Encodings
+** 4.1 Built-ins [README level-transcoder][LIVE]
+| Name       | Input accepted                | Stored format | Output           | Notes                                                    |
+|------------+-------------------------------+---------------+------------------+----------------------------------------------------------|
+| ='utf8'=   | String, Buffer, Uint8Array    | utf8          | String           | DEFAULT for keys and values; non-strings are stringified irreversibly (=[LIVE]= =42= → ='42'=, ={x:1}= → ='[object Object]'=, Buffer → its utf8 text) |
+| ='json'=   | any JSON value                | utf8          | as input         | =JSON.stringify= / =JSON.parse=; =[LIVE]= nested arrays/objects/null round-trip; reading non-JSON → =LEVEL_DECODE_ERROR= |
+| ='buffer'= | Buffer, Uint8Array, String    | buffer        | Buffer           | alias ='binary'=; Uint8Array input is wrapped without copy |
+| ='view'=   | Uint8Array, Buffer, String    | view          | Uint8Array       | =[LIVE]= output is a plain Uint8Array (not a Buffer) on both backends |
+| ='hex'=    | hex String, Buffer            | buffer        | hex String       | =[LIVE]= put ='deadbeef'= → 4 stored bytes; reading as utf8 gives garbage |
+| ='base64'= | base64 String, Buffer         | buffer        | base64 String    | =[LIVE]= ='1'= read as base64 → ='MQ=='=                  |
+Removed since level 7: ='id'=, ='ascii'=, ='ucs2'=, ='utf16le'= [UPGRADING level 8].
+
+** 4.2 Where encodings apply and how they are normalized [README abstract-level][LIVE]
+- Database defaults come from the constructor; sublevels default to utf8/utf8
+  independently; every read/write/iterator/clear call accepts per-call
+  =keyEncoding= / =valueEncoding= (table 4.4).
+- =db.keyEncoding(x)= / =db.valueEncoding(x)= normalize a name or object into a
+  transcoder encoding ={name, commonName, format, encode, decode}=. =[LIVE]= on
+  classic-level ='json'= → ={name:'json', format:'utf8'}= and ='view'= → ={name:'view',
+  format:'view'}=; on memory-level (store format buffer) they become ='json+buffer'= /
+  ='view+buffer'= with =format 'buffer'=. Code must compare =commonName=, never =name=.
+- Encodings are stateless; encode/decode may be called while the db is not open.
+- Keys and values may never be =null= / =undefined= (=LEVEL_INVALID_KEY= /
+  =LEVEL_INVALID_VALUE=); range options MAY be, and under utf8 they are stringified:
+  =[LIVE]= ={gt: undefined}= iterated NOTHING (bound ='undefined'= sorts after every
+  key in the probe) and ={gt: null}= started after ='null'=. So ={gt: undefined}= ≠ ={}=.
+
+** 4.3 Custom encodings [README level-transcoder][README abstract-level][LIVE]
+Interface: ={name: string, format: 'buffer'|'view'|'utf8', encode(data) → format,
+decode(format) → data}=; also accepted: =level-codec= objects (=type= as name alias,
+=buffer: boolean=), =abstract-encoding=, =multiformats= block codecs. Anonymous
+encodings (no name) get a non-deterministic generated name. =[LIVE]= a custom
+={name:'upper', format:'utf8'}= object worked per-call, was afterwards addressable by
+the string ='upper'=, and the raw utf8 read showed the encoded form. Passing a custom
+encoding object requires a JS object → only the binding namespace may build one; the
+public API takes a CLJS map ={:name :format :encode :decode}= (section 4.7).
+
+** 4.4 Per-call override matrix [README abstract-level][README classic-level]
+| Method                     | =keyEncoding= | =valueEncoding= | other encoding-related                       |
+|----------------------------+---------------+-----------------+----------------------------------------------|
+| =get= / =getSync= / =getMany= | yes        | yes             | =snapshot=, =fillCache=                      |
+| =has= / =hasMany=          | yes           | —               | =snapshot=                                   |
+| =put=                      | yes           | yes             | =sync=                                       |
+| =del=                      | yes           | —               | =sync=                                       |
+| =batch(ops, o)=            | batch-level + per-op | batch-level + per-op | per-op =sublevel=; op-level wins over batch-level |
+| chained =put= / =del=      | per-op        | per-op          | per-op =sublevel=; =write()= takes NO encoding options |
+| =iterator=                 | yes (ranges, seek targets, keys) | yes | =keys=, =values=, =snapshot=, =signal=, =highWaterMarkBytes=, =fillCache= |
+| =keys=                     | yes           | —               |                                              |
+| =values=                   | yes (ranges)  | yes             |                                              |
+| =seek(target, o)=          | yes           | —               |                                              |
+| =clear=                    | yes (ranges)  | —               | =snapshot=                                   |
+| =approximateSize= / =compactRange= | yes   | —               |                                              |
+
+** 4.5 Key ordering [README abstract-level][LIVE]
+- Byte-wise lexicographic order of the ENCODED key: =[LIVE]= utf8 keys ='10' < '100' <
+  '9'=; ='a' < 'z' < 'é'= (UTF-8 bytes); buffer keys =01 < ff=; the empty string sorts
+  first (=[LIVE]= ={lte: ''}= → =['']=, ={gt: ''}= → everything else).
+- ='json'= keys are stored as JSON text, so numbers sort as strings (=[LIVE]= =[10, 100,
+  9]=) — use =charwise= / =lexint=-style custom encodings for numeric order (1.5).
+- Sublevel keys are ordered inside their prefix; the parent iterates
+  =!name!key= entries among its own keys.
+
+** 4.6 Value data types under the no-interop rule
+Values come back as JS strings (utf8/hex/base64), JS objects/arrays (json), Buffers
+(buffer) or Uint8Arrays (view). Only strings and (converted) json data are natural CLJS
+values. Positions are in 4.7 and 10.3.
+
+** 4.7 House position: codecs by keyword
+| Keyword     | Upstream encoding | Read result in CLJS                           | Notes                                                              |
+|-------------+-------------------+-----------------------------------------------+--------------------------------------------------------------------|
+| =:utf8=     | ='utf8'=          | string                                        | default (matches upstream); library rejects non-string values with argument-error instead of letting utf8 stringify them (pitfall 8.4) |
+| =:json=     | ='utf8'= + library-side =JSON.stringify= / =JSON.parse= (11.8) | keywordized CLJS data (=clj->js= before write, =js->clj :keywordize-keys= after read) | lossy for keywords/sets/non-string map keys; keys become keywords on read; same bytes as upstream ='json'=, decode failures are codec-errors |
+| =:edn=      | ='utf8'= + library-side =pr-str= / =cljs.reader/read-string= | exact CLJS data | RECOMMENDED for CLJS values; no npm dependency; EDN-only reader (no =#=()= eval); uncertainty 9.12 |
+| =:buffer=   | ='buffer'=        | opaque Buffer                                 | passed through untouched; helpers in the binding ns (10.3)          |
+| =:view=     | ='view'=          | opaque Uint8Array                             | same                                                               |
+| =:hex= / =:base64= | ='hex'= / ='base64'= | string                                | the CLJS-friendly way to store binary without touching buffers; the string is validated before upstream sees it |
+| =:raw=      | ='buffer'=        | opaque Buffer                                 | pre-encoded string or bytes pass through untouched (11.8)          |
+| ={:name .. :format .. :encode .. :decode ..}= | custom object built by the binding | whatever =decode= returns | =:format= ∈ =#{:utf8 :buffer :view}=; functions receive/return strings for =:utf8= |
+Transit was considered and rejected: =transit-cljs= needs the =transit-js= npm package,
+violating the zero-extra-runtime-deps rule. Keys default to =:utf8=; the same keyword
+set applies to =:key-encoding=.
+
+* 5. Iterator, chained-batch and snapshot subtleties
+** 5.1 Concurrency rules [README abstract-level][LIVE]
+- Many iterators at once: allowed (each holds its own implicit snapshot; unclosed ones
+  pin old versions and cost memory — README "Note").
+- Per iterator: exactly one read (=next= / =nextv= / =all=) in flight; violation →
+  =LEVEL_ITERATOR_BUSY= rejection. =seek= during an in-flight read THROWS
+  =LEVEL_ITERATOR_BUSY= synchronously (=[LIVE]= both backends).
+- Parallel writes have NO defined order (README "Order Of Operations"); serialize at
+  the application level if it matters.
+
+** 5.2 seek [README abstract-level][LIVE]
+Synchronous; work is lazy. Next read yields keys ≥ target (≤ if =reverse=). Target
+outside the iterator's range options → natural end (=next= → =undefined=), but a later
+in-range =seek= revives the iterator (=[LIVE]=). =seek= accepts =keyEncoding=. Reverse
+seeks can be slower. classic-level does not pre-fill its read cache on the first
+=next= after a =seek= [README classic-level].
+
+** 5.3 Cleanup [README abstract-level][LIVE]
+- =for await= and =all()= close automatically; manual =next= / =nextv= loops MUST call
+  =close()= even after natural end or error — otherwise memory leaks and snapshot
+  pinning.
+- =close()= is idempotent, waits for an in-flight read, and is also triggered by
+  =db.close()= for every open iterator, chained batch and snapshot.
+- For core.async (Phase 3): closing the output channel must close the iterator; the
+  producer loop must call =close()= on natural end, on error, and on consumer
+  cancellation (10.4).
+
+** 5.4 =limit= semantics [LIVE]
+=limit: 0= yields nothing (not "unlimited"); =-1= and =Infinity= mean unlimited;
+=iterator.limit= reflects the option (=Infinity= when unset) and =iterator.count= the
+yielded count, so =remaining = limit - count=. With =reverse=, =limit= takes the
+highest keys. The library treats =nil= as unlimited and rejects negative values other
+than =-1= with an argument-error.
+
+** 5.5 =nextv= and =highWaterMarkBytes= [README classic-level][LIVE]
+=nextv(size)= returns up to =size= entries but stops early once the byte sum exceeds
+=highWaterMarkBytes= (default 16 KiB; =0= → one entry per call; =Infinity= not
+allowed). The same cap feeds classic-level's internal cache for =next= (≤ 1000
+entries). Phase 3 channel producer should use =nextv= with a configurable batch size
+(=:batch-size=, default 100) and =:high-water-mark-bytes= passthrough.
+
+** 5.6 Chained batch [README abstract-level][LIVE]
+- Must be created on an OPEN db (synchronous =LEVEL_DATABASE_NOT_OPEN= otherwise).
+  Since the library's =open!= awaits =open()=, this is naturally satisfied.
+- =put= / =del= validate synchronously; may forward to native storage immediately
+  (hence encodings only on =put= / =del=, not =write=).
+- =write()= commits atomically and auto-closes; =clear()= empties the queue;
+  =close()= discards; after either, further ops throw =LEVEL_BATCH_NOT_OPEN=.
+- =length= counts queued ops (including ones added by =prewrite= hooks).
+- On some implementations chained batch is just sugar; on classic-level it avoids
+  copying the whole op array at once.
+
+** 5.7 Snapshot isolation [README abstract-level][README classic-level][LIVE]
+Implicit snapshots for =get= / =getMany= / iterators (created synchronously) give
+"snapshot guarantees": simultaneous writes are invisible to a read that started
+earlier. Explicit snapshots (2.8) extend this across several reads and must be closed;
+they "may cause the database to temporarily pause internal storage optimizations".
+=clear= may take its own internal snapshot unless one is passed.
+
+** 5.8 Aborting [README abstract-level][LIVE]
+Iterator =signal= aborts an in-progress read and rejects later reads with
+=LEVEL_ABORTED= but does NOT close the iterator. classic-level advertises support;
+memory-level does not advertise yet honoured a pre-aborted signal. The library does
+not expose signals in Phase 2/3 (uncertainty 9.5); channel close is the cancellation
+primitive.
+
+* 6. Events and hooks
+** 6.1 Events [README abstract-level][LIVE]
+| Event      | Args                                   | Notes                                                                                            |
+|------------+----------------------------------------+--------------------------------------------------------------------------------------------------|
+| =opening=  | —                                      |                                                                                                  |
+| =open=     | —                                      | (=ready= alias removed in v2)                                                                    |
+| =closing=  | —                                      |                                                                                                  |
+| =closed=   | —                                      |                                                                                                  |
+| =write=    | =operations[]=                         | after =put= / =del= / =batch= / chained =write= succeeded; ops normalized: ={type, key, value, keyEncoding (object), valueEncoding (object), encodedKey, encodedValue, ...userland options}=; =[LIVE]= =key= / =value= are the ORIGINAL inputs (=value= was the decoded ={a:1}= on a json sublevel), =encodedValue= the encoded form; the parent db emits a second =write= with the prefixed key and the already-encoded value; listeners added after the write was issued do not fire for it |
+| =clear=    | =options=                              | verbatim options object (=[LIVE]= ={gte:'ev', lte:'ev2'}=)                                        |
+| =put= / =del= / =batch= | —                         | REMOVED (abstract-level 3); =console.warn(ModuleError LEVEL_LEGACY)= once per message, no throw, listener never called [LIVE][SRC] |
+=db.supports.events= lists exactly the six live ones. Sublevels emit their own events.
+
+** 6.2 Hooks [README abstract-level][LIVE]
+=db.hooks.prewrite= (sync; may modify/add ops), =db.hooks.postopen= (async; runs
+inside open, db is "locked" → =LEVEL_STATUS_LOCKED= on nested open/close),
+=db.hooks.newsub= (sync). "Experimental and subject to change without notice". Scope
+none; revisit if index maintenance is wanted (uncertainty 9.6).
+
+* 7. Process and filesystem facts [README classic-level][README abstract-level][LIVE]
+- Single process: abstract-level implementations do not support multi-process access;
+  classic-level enforces it with the LevelDB =LOCK= file (=LEVEL_LOCKED=). Worker
+  threads need =multithreading: true= (not probed).
+- Directory contents after a fresh open: =CURRENT=, =LOCK=, =LOG=, =LOG.old=,
+  =MANIFEST-nnnnnn=, plus =nnnnnn.log= / =nnnnnn.ldb= data files [LIVE].
+- =destroy= removes only LevelDB files; foreign files keep the directory (README).
+  =repair= writes to =LOG=.
+- Event loop: all classic-level operations except =getSync=, =getProperty=, iterator
+  construction, =seek= and chained-batch =put= / =del= run on the libuv threadpool and
+  return promises; =getSync= "blocks the event loop but can be significantly faster"
+  [UPGRADING level 10]. Large =batch= arrays are copied on the main thread (README
+  chained-batch rationale).
+- =approximateSize= excludes not-yet-flushed writes; =compactRange= is a manual
+  compaction trigger.
+
+* 8. Pitfalls checklist for leveldb-cljs (numbered)
+1. *=level= is 10.x, not 8.x.* Snippets with =level('path')=, callbacks, =err.notFound=,
+   =createReadStream=, =iterator.end()= or =put= / =del= / =batch= events are all dead
+   API. =get= of a missing key resolves =undefined= — the library must turn that into
+   =nil= and never look for a not-found error.
+2. *Chained batch needs an open db.* =db.batch()= throws synchronously while
+   ='opening'=. Everything else is deferred. The library's =open!= awaits =open()= so
+   clients are always ='open'= when handed out.
+3. *Two error delivery mechanisms.* Sync throws (iterator/batch/sublevel/snapshot
+   constructors, chained =put= / =del=) vs rejections (everything else, INCLUDING
+   =LEVEL_ITERATOR_BUSY=). Wrap every binding call in one adapter that yields a promesa
+   promise.
+4. *utf8 stringifies silently.* A CLJS map put under =:utf8= is stored as
+   ="[object Object]"=; a number as its decimal text; a Buffer as its utf8 text. Validate
+   =string?= under =:utf8= and require =:json= / =:edn= for data.
+5. *=nil= range bounds are not "absent".* ={gt: undefined}= / ={gt: null}= are encoded
+   as the strings ="undefined"= / ="null"= under utf8. Drop nil-valued range keys before
+   building the options object (=util/->camel-keys= already does).
+6. *=limit 0= means zero entries*, =-1= means unlimited; =reverse= + =limit= takes the
+   top keys; =gte= / =lte= beat =gt= / =lt=.
+7. *Keys sort by encoded bytes*, so ='10' < '9'= and ='z' < 'é'=; ='json'= keys sort
+   as text. Offer a documented order-preserving key codec later (charwise-like) rather
+   than pretending numeric order.
+8. *Values pass through the JSON encoder as JS.* Never hand a CLJS map to upstream
+   ='json'= — =JSON.stringify= would serialize the persistent-map internals. The
+   binding must =clj->js= on the way in; =:edn= avoids the problem entirely.
+9. *Sublevels reset encodings to utf8/utf8*; pass them explicitly. Names are printable
+   ASCII (bytes 35–126) or =LEVEL_INVALID_PREFIX=; the separator must sort below the
+   name bytes. Keys may contain the separator.
+10. *The parent sees the sublevel's keys and RAW values.* Iterating a root db with
+    sublevels yields =!name!key= entries whose values are encoded with the sublevel's
+    encoding, decoded with the root's — expect garbage or =LEVEL_DECODE_ERROR= when
+    they differ. Iterate sublevels through the sublevel.
+11. *Unclosed iterators/snapshots leak and pin old versions.* Manual =next= / =nextv=
+    loops must =close()=; =db.close()= sweeps them but only at the end.
+12. *Snapshots make writes invisible to reads that started earlier*, and a not-yet-
+    resolved write may be invisible to a later read. Await writes before reading.
+13. *Failed open causes are message-only* except =LEVEL_LOCKED=. Deferred operations
+    after a failed open reject with =LEVEL_DATABASE_NOT_OPEN= and a =null= =cause=; only
+    the =open()= promise carries the cause, which is why =open!= must await it.
+14. *=close()= closes sublevel handles for good.* Reopening the parent leaves existing
+    sublevel handles ='closed'= (=LEVEL_DATABASE_NOT_OPEN=); only a NEW =db.sublevel()=
+    call works. The library must re-derive sublevel handles after =open!= (9.13).
+15. *=write= event payloads differ per backend* (Buffer vs string =encodedKey=) and
+    contain the encoding OBJECTS; tests must assert on =type= / =key= / =value= only.
+16. *Legacy event names warn instead of throwing.* A listener on =:put= would silently
+    never fire; the library must reject unknown event names with an argument-error.
+17. *Options are shallow-merged, unknown keys ignored.* A typo in a kebab option key
+    (=:key-encodings=) is silently dropped; validate option keys per method (10.1).
+18. *No native fallback.* If the prebuilt binary cannot load, =require('level')= throws
+    at load time; the binding namespace should require lazily inside =open!= so the
+    error is a rejection with a clear message and so memory-level-only use still works.
+19. *Batch ops with a foreign =sublevel= are not validated by either backend* and the
+    write vanishes silently. Validate root identity in the library.
+20. *=getSync= / =getProperty= are synchronous and block*; if exposed, name them
+    =-sync= and document.
+21. *=clear= is not atomic* and =approximateSize= is approximate; do not build
+    invariants on either.
+22. *abstract-level messages change between minors*; match on =:code= only. The
+    =name= of ModuleErrors is ='Error'=, so never dispatch on =.name= except
+    ='AbortError'=.
+
+* 9. Uncertain / needs verification (numbered; each with the recommended house position)
+1. *Version expectation.* The task expected =level= 8.x; npm =latest= is 10.0.0 and the
+   GitHub README/CHANGELOG agree (no disagreement between npm and GitHub was found for
+   any package). Position: pin =^10.0.0=; do not support the 8.x/9.x API surface
+   (callbacks, not-found errors, legacy events). Parley should confirm the pin.
+2. *Foreign-root sublevel in batch ops.* README says the sublevel "must have the same
+   root"; =[LIVE]= both memory-level and classic-level accepted a sublevel of another
+   database without error and the entry was not readable anywhere afterwards. Settled
+   as a silent-loss hazard. Position: the library validates =(identical? (root a) (root
+   b))= and raises an argument-error before calling upstream.
+3. *=LEVEL_ITERATOR_BUSY= delivery.* README example wraps =iterator.all()= in a
+   synchronous =try/catch=; =[LIVE]= =next()= and =all()= both return rejected
+   promises. Position: treat all iterator reads as async; the core.async producer never
+   overlaps reads so users cannot hit it.
+4. *Message-only open failures.* =createIfMissing= / =errorIfExists= violations arrive
+   as a =cause= without =code=. Position: db-error =:code :database-not-open= with
+   =:cause-message=, plus a best-effort =:reason= ∈ =#{:locked :missing :exists :io}=
+   derived from the message text (documented as heuristic, tested against the exact
+   strings recorded in 3.4).
+5. *Abort signals.* Experimental; manifest says memory-level lacks support though it
+   honoured one. Position: not exposed; closing the core.async channel cancels.
+6. *Hooks.* Experimental. Position: not exposed in Phases 2–4.
+7. *Key/value size limits.* No documented limit in classic-level; LevelDB itself has
+   none but large values degrade compaction. Position: no library limit; document.
+8. *Multi-process access.* Only via =many-level= / =rave-level=. Position: out of
+   scope; =LEVEL_LOCKED= is surfaced as =:code :locked= via the cause.
+9. *=multithreading= open option.* Untested (worker threads). Position: pass through as
+   =:multithreading=, undocumented beyond a note.
+10. *Prebuild coverage.* Verified only on Linux x64 glibc with Node 22. Position:
+    README states "prebuilt binaries for the platforms listed in classic-level; otherwise
+    node-gyp"; Phase 5 smoke prints =process.platform= / =arch= and whether a compile
+    happened.
+11. *Deferred use vs eager open.* Upstream allows use while ='opening'=. Position:
+    =open!= returns a promise of an already-open client (awaits =db.open()=), so failure
+    causes surface once and chained batches always work; a =:defer? true= option can
+    be added later if wanted.
+12. *EDN codec details.* =cljs.reader/read-string= is the EDN reader (no code
+    evaluation) but is slower than =JSON.parse= and does not know custom tagged
+    literals unless registered. Position: =:edn= implemented with =pr-str= /
+    =cljs.reader/read-string= and an optional =:readers= map; default value codec stays
+    =:utf8= to match upstream; README recommends =:edn= for CLJS data.
+13. *Sublevel handles after parent reopen* — SETTLED =[LIVE]=: they stay ='closed'= and
+    reject =LEVEL_DATABASE_NOT_OPEN=; a fresh =db.sublevel(name)= works. Position: a
+    leveldb-cljs sublevel client stores =[name opts]= and re-derives its upstream
+    handle lazily whenever the root has been reopened (root keeps an open-generation
+    counter); Phase 2 test covers close → reopen → sublevel get.
+14. *Buffers under the no-interop rule.* Exposing Buffer/Uint8Array values means
+    users touch JS objects. Position: =:buffer= / =:view= values are opaque; the binding
+    namespace exports =bytes->hex=, =hex->bytes=, =bytes->utf8=, =utf8->bytes=,
+    =bytes-length= (re-exported from =core=) so callers never write interop; =:hex= /
+    =:base64= are recommended for CLJS-first code.
+15. *=getSync=.* Blocks the event loop but is faster. Position: expose as
+    =core/get-sync= (returns a value, not a promise) with a docstring warning; Parley to
+    decide whether to keep it in the public API.
+16. *Explicit sublevel =open()= after parent reopen.* Not probed whether calling
+    =sub.open()= on the stale handle revives it (abstract-level says sublevels "can be
+    individually closed and (re)opened"). Position: irrelevant under the re-derive
+    strategy of 13; probe only if that strategy proves costly.
+17. *level-supports README is stale* ("Not yet" for =explicitSnapshots= and =has= on
+    classic-level / memory-level) while =[LIVE]= manifests say =true=. Position: trust
+    =db.supports= at runtime; the library exposes it and gates =snapshot= on it.
+18. *=clear= atomicity on classic-level.* README: "not guaranteed to be atomic".
+    Position: document; users needing atomic range deletes iterate keys into a batch.
+19. *Snappy version* bundled is not recorded in a header. Position: irrelevant to the
+    API; noted for completeness.
+20. *Browser build.* =level= exports =browser-level= in browsers; the library is
+    Node-only (=js/require=). Position: out of scope; the binding namespace is the only
+    place a browser adapter would differ.
+
+* 10. Implementation notes for leveldb-cljs
+** 10.1 Kebab-case translation (implemented in =util=, Phase 0)
+- Options: =:key-encoding= → =keyEncoding=, =:value-encoding= → =valueEncoding=,
+  =:create-if-missing=, =:error-if-exists=, =:fill-cache=, =:high-water-mark-bytes=,
+  =:write-buffer-size=, =:cache-size=, =:block-size=, =:max-open-files=,
+  =:block-restart-interval=, =:max-file-size=, =:multithreading=, =:compression=,
+  =:sync=, =:reverse=, =:limit=, =:keys=, =:values=, =:gt= / =:gte= / =:lt= / =:lte=,
+  =:snapshot=, =:sublevel=, =:separator=. =util/->camel-keys= drops nil values and
+  leaves =:key= / =:value= / range bounds / =:snapshot= / =:sublevel= subtrees untouched
+  (they are user data or opaque handles).
+- Manifest and event payloads come back through =util/->kebab-keys=
+  (=implicitSnapshots= → =:implicit-snapshots=, =encodedKey= → =:encoded-key=).
+- Per-method option whitelists (pitfall 8.17) live in =core= as sets; unknown keys →
+  argument-error.
+- Error codes: =util/level-code->keyword=.
+
+** 10.2 Single binding namespace (=leveldb-cljs.binding=)
+The ONLY file with =js/require=, =.-prop=, =(.method obj)=, =#js=, =clj->js= /
+=js->clj=, =js/Promise=, =js/Buffer=. It exposes plain functions that take/return CLJS
+data and promesa promises: =load-level!=, =create-db=, =open!=, =close!=, =status=,
+=supports=, =get!=, =get-many!=, =has!=, =has-many!=, =put!=, =del!=, =batch!=,
+=chained-batch=, =cb-put!=, =cb-del!=, =cb-clear!=, =cb-write!=, =cb-close!=, =cb-length=,
+=iterator=, =it-next!=, =it-nextv!=, =it-all!=, =it-seek!=, =it-close!=, =it-count=,
+=clear!=, =sublevel=, =sublevel-prefix=, =snapshot=, =snapshot-close!=, =on!= / =off!=,
+=approximate-size!=, =compact-range!=, =get-property=, =destroy!=, =repair!=,
+=location=, =error->data= (reads =code= / =message= / =cause= / =name=), the bytes
+helpers of 9.14, and =->encoding= (builds a transcoder-shaped JS object from a codec
+map). Handles (db, iterator, chained batch, snapshot) are wrapped in opaque CLJS
+records so =core= never touches JS objects. No =^js= hints anywhere: shadow-cljs
+externs inference is unnecessary for =:node-script= / =:node-test= (no advanced
+minification of npm objects), and the binding uses =goog.object/get= /
+=unchecked-get= for property access where needed.
+
+** 10.3 Buffers and binary
+=:buffer= / =:view= values travel as opaque JS objects inside CLJS values. Helper
+functions (9.14) let callers convert without interop. =:hex= / =:base64= are the
+recommended CLJS-side binary representation.
+
+** 10.4 core.async iterator design (Phase 3, =leveldb-cljs.iter=)
+- =(entries client opts)= / =(keys client opts)= / =(values client opts)= return a
+  channel (buffer size =:buffer=, default 32). Producer: =nextv(batch-size)= loop
+  (=:batch-size= default 100) → =>!= each entry as =[k v]= (or =k= / =v=); on =[]= →
+  =close!= channel and =it.close()=; on error → put ={:error e}= (wrapped db-error) then
+  close both; if the consumer closes the channel (=>!= returns false) → =it.close()=.
+- One read in flight per iterator by construction (5.1).
+- =(collect! ch)= → promise of a vector; =(reduce! f init ch)= helper.
+- Events: =(events client #{:write :clear ...})= → channel of ={:event :write :ops [...]}=
+  with kebab op maps; the listener is removed when the channel closes.
+
+** 10.5 Error normalization algorithm (binding =error->data= + =core/wrap=)
+1. If the value already is a leveldb-cljs ex-info, pass through.
+2. Read =code=, =message=, =name=, =cause= (and =cause.code= / =cause.message=).
+3. Build =util/db-error= with =:code (level-code->keyword code)=, =:cause= (opaque),
+   =:cause-code=, =:cause-message=, =:name=, =:op=, plus =:reason= per 9.4 for
+   =:database-not-open=.
+4. Synchronous throws are caught by the binding and returned as =p/rejected=.
+
+** 10.6 Test strategy
+Unit tests use =memory-level= through the same binding (constructor injected via
+=(core/open! {:backend :memory ...})=) — no disk, no network. Assertions avoid the
+backend-specific facts of 1.4. Phase 5 runs the same scenarios on a temp on-disk
+=Level= in =$TMPDIR= and =destroy!=s it; it also exercises =:locked= (two instances),
+=:create-if-missing false= and =:error-if-exists true= shapes (3.4).
+
+* 11. Phase 2 implementation outline
+All public functions take a client (or handle) first, kebab keyword maps for options,
+and return promesa promises unless marked (sync). Names ending in =!= perform I/O.
+** 11.1 =leveldb-cljs.binding= — the only interop namespace (see 10.2)
+** 11.2 =leveldb-cljs.codec= — pure codec descriptors
+- =builtin= : =#{:utf8 :json :edn :buffer :view :hex :base64}=
+- =(resolve x)= → codec map ={:name :format :upstream :encode :decode}= from a keyword or
+  a custom map; throws argument-error for unknown keywords / bad maps
+- =(edn-codec {:readers ..})=, =(json-codec)=, =(utf8-codec)= …
+- =(encode codec v)= / =(decode codec s)= (sync, pure; used by the binding for
+  library-side codecs and by tests)
+- =(check-value! codec v)= — argument-error for nil, or non-string under =:utf8=
+** 11.3 =leveldb-cljs.core= — client and operations
+- =(open! {:location "path" :backend :level|:memory :key-encoding :utf8
+  :value-encoding :utf8 :create-if-missing true :error-if-exists false :compression
+  :cache-size :write-buffer-size :block-size :max-open-files :block-restart-interval
+  :max-file-size :multithreading :store-encoding})= → promise of client (already open)
+- =(close! client)=, =(status client)= (sync keyword =:opening= …), =(supports client)=
+  (sync kebab map), =(location client)= (sync), =(open? client)=
+- =(get! client key & [opts])= → value or nil; =(get-many! client keys & [opts])= →
+  vector with nils; =(has! client key & [opts])= → boolean; =(has-many! client keys &
+  [opts])=; =(get-sync client key & [opts])= (sync, 9.15)
+- =(put! client key value & [opts])=, =(del! client key & [opts])=
+- =(batch! client ops & [opts])= — ops =[{:type :put :key k :value v :key-encoding
+  .. :value-encoding .. :sublevel sub} {:type :del :key k}]=; validates types and
+  sublevel roots
+- =(clear! client & [{:gt :gte :lt :lte :reverse :limit :key-encoding :snapshot}])=
+- =(sublevel client name & [{:separator :key-encoding :value-encoding}])= → client
+  (sync); =(prefix client)=, =(path client & [local?])=, =(parent client)=,
+  =(root client)=
+- =(snapshot client)= (sync) → snapshot handle; =(close-snapshot! snap)=;
+  =(with-snapshot! client (fn [snap] …))= → promise, closes in =finally=
+- =(all! client & [opts])= / =(keys! client & [opts])= / =(values! client & [opts])= →
+  promise of a vector (convenience over =iterator.all()=; =:limit= recommended)
+- error helpers re-exported from =util=: =error-data=, =error-type=, =error-code=,
+  =not-open?=
+- bytes helpers re-exported from =binding=: =bytes->hex=, =hex->bytes=, =bytes->utf8=,
+  =utf8->bytes=, =bytes-length=
+** 11.4 =leveldb-cljs.batch= — chained batch
+- =(chained client)= (sync; client must be open — always true for =open!= clients) →
+  batch handle
+- =(put batch key value & [opts])=, =(del batch key & [opts])= (sync, chainable, throw
+  argument-error / db-error), =(clear batch)= (sync), =(length batch)= (sync),
+  =(write! batch & [{:sync true}])=, =(close! batch)=
+- =(with-batch! client (fn [batch] …))= → promise; writes on success, closes on error
+** 11.5 =leveldb-cljs.iter= — core.async (Phase 3, listed so Phase 2 leaves the hooks)
+- =(entries client & [opts])=, =(keys client & [opts])=, =(values client & [opts])= →
+  channel; opts add =:batch-size=, =:buffer=, =:high-water-mark-bytes=, =:fill-cache=,
+  =:snapshot=
+- =(iterator client & [opts])= → iterator handle for manual use: =(next! it)=,
+  =(nextv! it n)=, =(all! it)=, =(seek! it target & [opts])= (sync), =(close! it)=,
+  =(count it)= (sync)
+- =(collect! ch)=, =(events client & [event-set])= → channel, =(close-events! ch)=
+** 11.6 =leveldb-cljs.admin= — classic-level extras (Phase 4)
+- =(approximate-size! client start end & [opts])=, =(compact-range! client start end &
+  [opts])=, =(property client name)= (sync string), =(destroy! location)=,
+  =(repair! location)=
+** 11.7 =leveldb-cljs.util= — Phase 0 (done): case translation, code translation, errors.
+Phase 2 additions: per-method option whitelists, =range-opts= normalization (nil
+dropping, =:limit= validation), =normalize-op= for batch ops.
+
+** 11.8 Implementation record (Phase 2+3, 2026-09-25)
+Delivered as =src/leveldb_cljs/{core,codec,iter}.cljs= (+ Phase 2 helpers appended to
+=util=). Deviations from the outline above, each with the reason:
+- *=binding= and =batch= are folded into =core=.* The task directive made =core= the single
+  interop namespace; a separate =batch= namespace would have been a pure re-export.
+  Chained batches are =core/chained-batch=, =batch-put!=, =batch-del!=, =batch-clear!=,
+  =batch-length=, =batch-write!=, =batch-close!=, =with-batch!=. Upstream methods are
+  called with =js-invoke= (no =^js= hints; Closure's default externs only know some
+  method names, the rest would emit infer warnings).
+- *Manual iterator handles live in =core=* (=iterator=, =key-iterator=, =value-iterator=,
+  =it-next!=, =it-nextv!=, =it-all!=, =it-seek!=, =it-close!=, =it-count=, =it-open?=)
+  because =iter= may not do interop; =iter= adds the channels, =collect!=, =reduce!=,
+  =entries-seq!=, =keys-seq!=, =values-seq!=, =error?=.
+- *Silent-stringify guard raises =:leveldb-cljs/codec-error=* (11.2 said argument-error):
+  the task fixed the type. =nil= keys/values stay argument-errors.
+- *=:json= is library-side* (=clj->js= + =JSON.stringify= on write, =JSON.parse= +
+  =js->clj :keywordize-keys= on read, upstream ='utf8'=) instead of upstream ='json'=
+  (4.7): identical bytes on disk, and decode failures become codec-errors with the raw
+  text instead of =LEVEL_DECODE_ERROR=. Section 4.7's row for =:json= should be read
+  accordingly.
+- *=:raw= codec added*: pre-encoded string or bytes pass through untouched (upstream
+  ='buffer'=), reads yield the stored bytes.
+- *Sublevel clients inherit the parent's codecs* (upstream resets to utf8/utf8, 2.7);
+  every call passes the codec's upstream encoding explicitly, so the upstream default
+  never applies. =:key-encoding= / =:value-encoding= on =sublevel= still override.
+- *Sublevel handle re-derivation* keys on both the root's open generation and the
+  parent's handle identity, so =close!= + =open!= of a sublevel client refreshes its
+  descendants too. =open!= on an already-open root does not bump the generation.
+- *=open!= option names*: =:path= (alias =:location=), =:memory?= (instead of
+  =:backend :memory=), boolean options accept a =?= suffix (=:create-if-missing?=)
+  which =util/normalize-opts= strips before the camelCase translation.
+- *=has!= keeps the outline name* (the task summary wrote =has?=); =get-sync= is exposed
+  with the blocking caveat in its docstring (9.15).
+- *=core/open-resources=* counts open iterator/snapshot/batch handles per root (the
+  tests use it to prove channel close releases the upstream iterator).
+- *Channel cancellation*: core.async =close!= does not wake a parked put, so the producer
+  parks with =alts!= against a 100 ms timeout and re-checks =closed?= (10.4 assumed
+  =>!= would return false). The upstream iterator is closed BEFORE the channel closes.
+- *Events channel* (=iter/events=) not delivered in Phase 3; moved to Phase 4 with
+  =admin=.
+- Verified while implementing: =cljs.reader/read-string= returns =nil= (not the =:eof=
+  sentinel) for the empty string, so the =:edn= codec treats ="" = as a decode error
+  explicitly; the EDN reader reads the first form only (trailing text is ignored).
+
+* 12. Sources
+** npm registry (=npm view=, 2026-09-25)
+- https://www.npmjs.com/package/level — 10.0.0 (2025-04-20); dist-tags latest 10.0.0, next 5.0.0-0; engines node ≥ 18; deps abstract-level ^3.1.0, browser-level ^3.0.0, classic-level ^3.0.0; version dates 8.0.0 2022-03-25, 8.0.1 2024-01-27, 9.0.0 2024-12-01
+- https://www.npmjs.com/package/classic-level — 3.0.0 (2025-04-20); deps abstract-level ^3.1.0, module-error, napi-macros, node-gyp-build
+- https://www.npmjs.com/package/abstract-level — 3.1.1 (2025-09-29); deps buffer, is-buffer, level-supports ^6.2.0, level-transcoder ^1.0.1, maybe-combine-errors, module-error
+- https://www.npmjs.com/package/memory-level — 3.1.0 (2025-04-20); deps abstract-level ^3.1.0, functional-red-black-tree, module-error
+- https://www.npmjs.com/package/memdown — 6.1.1, deprecated "Superseded by memory-level"
+- https://www.npmjs.com/package/levelup — 5.1.1 deprecated; https://www.npmjs.com/package/leveldown — 6.1.1 deprecated
+- =memorydown= — E404 (does not exist)
+- https://www.npmjs.com/package/level-transcoder — 1.0.1; https://www.npmjs.com/package/level-supports — 6.2.0
+- https://www.npmjs.com/package/level-read-stream — 2.0.0; level-web-stream 1.1.0; browser-level 3.0.0; many-level 2.0.0; rave-level 1.0.0; charwise 3.0.1; lexicographic-integer-encoding 1.0.1; transit-js 0.8.874; source-map-support 0.5.21
+** GitHub (raw files, default branches, 2026-09-25)
+** Live probes (2026-09-25, Node v22.23.2, Linux x64; scripts =probe.js=, =probe2.js=, =probe3.js= in the job tmp dir, not part of the repo)
+- memory-level and classic-level (via =level=): sublevel handle after parent close → reopen (stale) vs fresh handle, foreign-root sublevel in batch (silent loss), seek during in-flight read (sync busy), status transitions, deferred get/put, chained batch before open, open idempotence, get/getMany/has/hasMany/getSync on present and missing keys, null/undefined key and value, utf8 stringification, json round-trip and decode error, unknown encoding, buffer/view/hex/base64 reads, hex round-trip, custom encoding by object and by name, =keyEncoding()= normalization, iterator ranges (empty string bounds, gte+gt precedence, undefined/null bounds, inverted range), limit 0/-1/2+reverse, keys:false / values:false, iterator busy on next and all, seek out of range and back, count/limit, close idempotence, next after close, nextv batching, concurrent iterators, implicit and explicit snapshots, abort signal, batch array with per-op encoding, bad op type, empty batch, chained batch write/length/after-write/clear/close/invalid key, sublevel prefix/path/parent/root/separator/empty name/invalid names/user key containing separator/batch with sublevel/range prefixing/clear scope/foreign-root sublevel, events (six live + legacy warning), clear with limit+reverse, close waiting for pending put, get and iterator after close, sublevel status after parent close, reopen, hooks keys, Symbol.asyncDispose, passive open on closed db, storeEncoding utf8 + view, unknown iterator option, deferred op after failed open, key ordering (numeric strings, unicode, json keys, buffer bytes).
+- classic-level only: =location=, second instance lock, createIfMissing false, errorIfExists true, recursive directory creation, approximateSize, compactRange, getProperty, sync and fillCache options, highWaterMarkBytes 0, buffer key order, directory file list, destroy, repair on missing location, =Level.destroy= identity, prebuild directory listing, absence of a local build dir after install.

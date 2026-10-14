@@ -1,0 +1,42 @@
+;; shadow-cljs configuration for leveldb-cljs.
+;; Standalone (no :deps) so `npx shadow-cljs ...` only needs Java + node_modules.
+;; promesa (pure ClojureScript, no npm package) is resolved from Clojars by the
+;; standalone shadow-cljs CLI via the :dependencies key below; deps.edn mirrors
+;; core.async ships with shadow-cljs itself (used by leveldb-cljs.iter for
+;; iterator channels, Phase 3).
+;; The `level` / `memory-level` npm packages are required at runtime by the single
+;; binding namespace (Phase 2); shadow's :node-* targets leave npm requires external.
+{:source-paths ["src" "test" "dev"]
+ :dependencies [[funcool/promesa "12.0.1"]]
+ :builds
+ {;; Unit tests. `npx shadow-cljs compile node-test` compiles AND runs them (:autorun).
+  ;; NOTE: shadow's autorun does not propagate the test exit status, so ./run-tests.sh
+  ;; compiles with `--config-merge '{:autorun false}'` and runs `node target/node-test.js`.
+  :node-test {:target :node-test
+              :output-to "target/node-test.js"
+              :ns-regexp "-test$"
+              :autorun true}
+
+  ;; Interactive development build for a Node REPL:
+  ;;   npx shadow-cljs watch dev          ; terminal 1: compiles + hot reloads
+  ;;   node target/dev.js                 ; terminal 2: starts the Node runtime the REPL attaches to
+  ;;   npx shadow-cljs cljs-repl dev      ; terminal 3: REPL inside that Node process
+  :dev {:target :node-script
+        :main leveldb-cljs.dev/main
+        :output-to "target/dev.js"
+        :devtools {:enabled true}}
+
+  ;; Phase 4 live smoke: a REAL on-disk classic-level database in a fresh directory
+  ;; under the OS temp dir (removed afterwards) next to a memory-level one. No network.
+  ;;   npx shadow-cljs compile smoke && node target/smoke.js
+  :smoke {:target :node-script
+          :main leveldb-cljs.smoke/main
+          :output-to "target/smoke.js"}
+
+  ;; The quick start of the README (dev/leveldb_cljs/examples.cljs): a
+  ;; database in a fresh directory under the OS temp dir (removed
+  ;; afterwards); prints what it read. No network.
+  ;;   npx shadow-cljs compile examples && node target/examples.js
+  :examples {:target :node-script
+             :main leveldb-cljs.examples/main
+             :output-to "target/examples.js"}}}

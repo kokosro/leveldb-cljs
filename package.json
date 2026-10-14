@@ -1,0 +1,18 @@
+{
+  "name": "leveldb-cljs",
+  "version": "0.1.0",
+  "description": "ClojureScript (Node.js) client for LevelDB via the `level` (classic-level / abstract-level) package: kebab-case maps in/out, promesa promises, core.async iterators; JS interop confined to one binding namespace",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "test": "./run-tests.sh"
+  },
+  "dependencies": {
+    "level": "^10.0.0"
+  },
+  "devDependencies": {
+    "memory-level": "^3.1.0",
+    "shadow-cljs": "^2.28.23",
+    "source-map-support": "^0.5.21"
+  }
+}
