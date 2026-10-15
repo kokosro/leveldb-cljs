@@ -2,9 +2,11 @@
 
 
 `leveldb-cljs` is a client for LevelDB on Node.js, built on the
+`level` npm package, a Node-API binding of LevelDB 1.20. LevelDB is a single-process key-value
 store: a directory on disk, keys kept in sorted order, atomic batches, range scans and
 snapshots, with no server to run. The library exposes it as plain ClojureScript: values
 are ClojureScript data under a codec of your choice, options and results are kebab-case
+keyword maps, every I/O operation returns a promesa
 promise, and iterators and change events are `core.async` channels. It needs no network.
 `level` is the only runtime npm dependency.
 
@@ -22,6 +24,7 @@ Open a database in a fresh directory, put and get a value, write a batch, read r
 close, open again and find the data still there. You need Node.js 18 or later and a JDK
 (for shadow-cljs).
 
+**1. Get the code.** `level` itself is an npm package that
 your project installs; it ships prebuilt binaries for the common platforms.
 
 ```sh
@@ -305,6 +308,7 @@ The library decides nothing about the tuning of LevelDB. The options of `open!` 
 concern it (`:cache-size`, `:write-buffer-size`, `:block-size`, `:max-open-files`,
 `:max-file-size`, `:compression`) are handed to `level` as given, and one that is absent
 is absent for `level` as well, whose
+own default then applies:
 
 ```clojure
 (db/open! {:path "data"
@@ -455,6 +459,7 @@ Byte values are opaque. They are made, read and compared without interop:
 ### A database in memory
 
 `(db/open! {:memory? true})` opens a database in the memory of the process, on the
+`memory-level` package, a development dependency of the checkout that a project of your own
 then installs too. It has the same API and leaves nothing behind, which suits tests.
 
 ## Error handling
