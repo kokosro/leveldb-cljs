@@ -10,22 +10,27 @@ keyword maps, every I/O operation returns a promesa
 promise, and iterators and change events are `core.async` channels. It needs no network.
 `level` is the only runtime npm dependency.
 
+- [Requirements](#requirements)
 - [Quick start](#quick-start)
-- [What to use it for](#what-to-use-it-for)
-- [Sizes are yours](#sizes-are-yours)
-- [Features](#features)
+- [Scenarios](#scenarios)
 - [Error handling](#error-handling)
-- [Reference](#reference)
+- [Features](#features)
+- [Limits and settings](#limits-and-settings)
+- [Documentation](#documentation)
+- [Layout](#layout)
 - [Development](#development)
+
+## Requirements
+
+You need Node.js 18 or later and a JDK (for shadow-cljs). `level` itself is an npm
+package that your project installs; it ships prebuilt binaries for the common platforms.
 
 ## Quick start
 
 Open a database in a fresh directory, put and get a value, write a batch, read ranges,
-close, open again and find the data still there. You need Node.js 18 or later and a JDK
-(for shadow-cljs).
+close, open again and find the data still there.
 
-**1. Get the code.** `level` itself is an npm package that
-your project installs; it ships prebuilt binaries for the common platforms.
+**1. Get the code.**
 
 ```sh
 
@@ -162,7 +167,7 @@ npm install
 npx shadow-cljs compile examples && node target/examples.js
 ```
 
-## What to use it for
+## Scenarios
 
 The examples take an open client `c` and these namespaces:
 
@@ -302,37 +307,73 @@ Without `:only` the channel carries the events of the lifecycle as well: `:openi
 `:open`, `:closing`, `:closed`. The events are those of this process: LevelDB admits one
 process per directory.
 
-## Sizes are yours
+## Error handling
 
-The library decides nothing about the tuning of LevelDB. The options of `open!` that
-concern it (`:cache-size`, `:write-buffer-size`, `:block-size`, `:max-open-files`,
-`:max-file-size`, `:compression`) are handed to `level` as given, and one that is absent
-is absent for `level` as well, whose
-own default then applies:
+Functions ending in `!` reject and never throw; the few that return a value (`get-sync`,
+`sublevel`, `snapshot`, `iterator`, `chained-batch`, `it-seek!`, `batch-put!`,
+`batch-del!`, `batch-clear!`) throw. Either way the error is an `ex-info` whose `ex-data`
+carries a `:type`:
+
+| `:type` | Meaning |
+|---------|---------|
+| `:leveldb-cljs/argument-error` | an argument was refused before the database was called (`:arg`, `:op`) |
+| `:leveldb-cljs/codec-error` | a value could not be encoded or decoded (`:codec`, `:direction`, `:role`) |
+| `:leveldb-cljs/db-error` | the database raised it: `:code` is the code of `level` in kebab-case, such as `:database-not-open`, `:iterator-not-open`, `:not-supported`; `:op` is the operation |
+
+`db/error-data`, `db/error-type`, `db/error-code` and `db/not-open?` read an error. A
+read with every failure turned into data, here on a client with the `:utf8` codec for its
+values:
 
 ```clojure
-(db/open! {:path "data"
-           :value-encoding :edn
-           :cache-size 67108864
-           :write-buffer-size 16777216})
+(defn explain
+  "What went wrong, as data."
+  [e]
+  (select-keys (db/error-data e) [:type :code :reason :op :arg]))
 
-(db/put! c "k" {:n 1} {:sync true})
+(defn read!
+  "Promise of {:value v} for the value under `key`, or of {:failed data}.
+   Never rejects."
+  [c key]
+  (-> (db/get! c key)
+      (p/then (fn [v] {:value v}))
+      (p/catch (fn [e] {:failed (explain e)}))))
 ```
 
-What the library sets itself concerns the channels and the keys, and all of it can be
-overridden:
+```clojure
+(read! c "a")
+;; resolves to
+{:value "1"}
 
-| Option | Where | Absent |
-|--------|-------|--------|
-| `:batch-size` | `iter/entries!`, `iter/keys!`, `iter/values!` | 100 entries are fetched per read |
-| `:buffer` | the same, and `db/events!` | the channel buffers 32 values |
-| `:key-encoding`, `:value-encoding` | `open!`, a sublevel, a single call | `:utf8` at `open!`; a sublevel takes those of its parent; a call takes those of its client |
-| `:separator` | `db/sublevel` | `"!"` |
-| `:limit` | every range | no limit |
+(db/close! c)
+(read! c "a")
+;; resolves to
+{:failed {:type :leveldb-cljs/db-error :code :database-not-open :op :get}}
+```
 
-A range without a `:limit` read through `db/all!`, `db/keys!` or `db/values!` is in
-memory as a whole. For a range that may be large, give a `:limit` or read it as a
-channel.
+A directory that another client holds open cannot be opened. `open!` waits until the
+database is open, so the failure is its rejection and not that of the first read:
+
+```clojure
+(-> (db/open! {:path "data"})
+    (p/catch (fn [e] (explain e))))
+;; resolves to
+{:type :leveldb-cljs/db-error :code :database-not-open :reason :locked :op :open}
+```
+
+`:reason` is `:locked`, `:missing` (with `:create-if-missing? false`), `:exists` (with
+`:error-if-exists? true`) or `:io`.
+
+A map under the `:utf8` codec, and an option that does not exist:
+
+```clojure
+(db/put! c "b" {:n 1})
+;; rejects with the ex-data
+{:type :leveldb-cljs/codec-error :codec :utf8 :direction :encode :role :value :value {:n 1}}
+
+(db/get! c "a" {:encoding :utf8})
+;; rejects with the ex-data
+{:type :leveldb-cljs/argument-error :arg :opts :op :get :unknown #{:encoding}}
+```
 
 ## Features
 
@@ -462,75 +503,39 @@ Byte values are opaque. They are made, read and compared without interop:
 `memory-level` package, a development dependency of the checkout that a project of your own
 then installs too. It has the same API and leaves nothing behind, which suits tests.
 
-## Error handling
+## Limits and settings
 
-Functions ending in `!` reject and never throw; the few that return a value (`get-sync`,
-`sublevel`, `snapshot`, `iterator`, `chained-batch`, `it-seek!`, `batch-put!`,
-`batch-del!`, `batch-clear!`) throw. Either way the error is an `ex-info` whose `ex-data`
-carries a `:type`:
-
-| `:type` | Meaning |
-|---------|---------|
-| `:leveldb-cljs/argument-error` | an argument was refused before the database was called (`:arg`, `:op`) |
-| `:leveldb-cljs/codec-error` | a value could not be encoded or decoded (`:codec`, `:direction`, `:role`) |
-| `:leveldb-cljs/db-error` | the database raised it: `:code` is the code of `level` in kebab-case, such as `:database-not-open`, `:iterator-not-open`, `:not-supported`; `:op` is the operation |
-
-`db/error-data`, `db/error-type`, `db/error-code` and `db/not-open?` read an error. A
-read with every failure turned into data, here on a client with the `:utf8` codec for its
-values:
+The library decides nothing about the tuning of LevelDB. The options of `open!` that
+concern it (`:cache-size`, `:write-buffer-size`, `:block-size`, `:max-open-files`,
+`:max-file-size`, `:compression`) are handed to `level` as given, and one that is absent
+is absent for `level` as well, whose
+own default then applies:
 
 ```clojure
-(defn explain
-  "What went wrong, as data."
-  [e]
-  (select-keys (db/error-data e) [:type :code :reason :op :arg]))
+(db/open! {:path "data"
+           :value-encoding :edn
+           :cache-size 67108864
+           :write-buffer-size 16777216})
 
-(defn read!
-  "Promise of {:value v} for the value under `key`, or of {:failed data}.
-   Never rejects."
-  [c key]
-  (-> (db/get! c key)
-      (p/then (fn [v] {:value v}))
-      (p/catch (fn [e] {:failed (explain e)}))))
+(db/put! c "k" {:n 1} {:sync true})
 ```
 
-```clojure
-(read! c "a")
-;; resolves to
-{:value "1"}
+What the library sets itself concerns the channels and the keys, and all of it can be
+overridden:
 
-(db/close! c)
-(read! c "a")
-;; resolves to
-{:failed {:type :leveldb-cljs/db-error :code :database-not-open :op :get}}
-```
+| Option | Where | Absent |
+|--------|-------|--------|
+| `:batch-size` | `iter/entries!`, `iter/keys!`, `iter/values!` | 100 entries are fetched per read |
+| `:buffer` | the same, and `db/events!` | the channel buffers 32 values |
+| `:key-encoding`, `:value-encoding` | `open!`, a sublevel, a single call | `:utf8` at `open!`; a sublevel takes those of its parent; a call takes those of its client |
+| `:separator` | `db/sublevel` | `"!"` |
+| `:limit` | every range | no limit |
 
-A directory that another client holds open cannot be opened. `open!` waits until the
-database is open, so the failure is its rejection and not that of the first read:
+A range without a `:limit` read through `db/all!`, `db/keys!` or `db/values!` is in
+memory as a whole. For a range that may be large, give a `:limit` or read it as a
+channel.
 
-```clojure
-(-> (db/open! {:path "data"})
-    (p/catch (fn [e] (explain e))))
-;; resolves to
-{:type :leveldb-cljs/db-error :code :database-not-open :reason :locked :op :open}
-```
-
-`:reason` is `:locked`, `:missing` (with `:create-if-missing? false`), `:exists` (with
-`:error-if-exists? true`) or `:io`.
-
-A map under the `:utf8` codec, and an option that does not exist:
-
-```clojure
-(db/put! c "b" {:n 1})
-;; rejects with the ex-data
-{:type :leveldb-cljs/codec-error :codec :utf8 :direction :encode :role :value :value {:n 1}}
-
-(db/get! c "a" {:encoding :utf8})
-;; rejects with the ex-data
-{:type :leveldb-cljs/argument-error :arg :opts :op :get :unknown #{:encoding}}
-```
-
-## Reference
+## Documentation
 
 - [`docs/leveldb-cljs.org`](docs/leveldb-cljs.org) is the manual: clients, codecs, the
   operations, batches, sublevels, iterators, the events channel, `clear!` and
@@ -542,8 +547,31 @@ A map under the `:utf8` codec, and an option that does not exist:
 Not exposed: the maintenance functions of `classic-level` (`approximateSize`,
 `compactRange`, `getProperty`, `destroy`, `repair`).
 
+## Layout
+
 Every public function carries a docstring; the namespaces are `leveldb-cljs.core`,
 `leveldb-cljs.iter`, `leveldb-cljs.codec` and `leveldb-cljs.util`.
+
+```
+src/leveldb_cljs/
+  core.cljs     the level binding and the client: lifecycle, reads, writes, batches, sublevels, snapshots, iterator handles, the events channel, bytes helpers
+  iter.cljs     iterators as core.async channels over the handles of core, and the promise helpers (no interop)
+  codec.cljs    the codec descriptors: the builtin codecs, custom codec maps, encode and decode (pure)
+  util.cljs     case translation, LEVEL_* code translation, the ex-info constructors and predicates, option normalisation, batch-op validation (pure)
+dev/leveldb_cljs/
+  examples.cljs   the examples of this README
+  smoke.cljs      the smoke: a database on disk in a temp directory beside one in memory, driven through the public API
+  dev.cljs        the entry point of the REPL build
+test/leveldb_cljs/
+  util_test.cljs, codec_test.cljs, core_test.cljs, iter_test.cljs, events_test.cljs   the suite, one per namespace and one for the events channel
+  examples_test.cljs   the examples of this README, run: it holds the README to the code
+  test_util.cljs       fixtures: a client in memory and one on disk in a temp directory, so both backends are exercised
+  doctest.clj          macros of the examples test
+test/publicity_gate.sh   the documentation gate that run-tests.sh runs first
+docs/
+  leveldb-cljs.org            the manual
+  leveldb-api-inventory.org   the API inventory
+```
 
 ## Development
 
