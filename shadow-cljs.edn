@@ -3,9 +3,9 @@
 ;; promesa (pure ClojureScript, no npm package) is resolved from Clojars by the
 ;; standalone shadow-cljs CLI via the :dependencies key below; deps.edn mirrors
 ;; core.async ships with shadow-cljs itself (used by leveldb-cljs.iter for
-;; iterator channels, Phase 3).
+;; iterator channels).
 ;; The `level` / `memory-level` npm packages are required at runtime by the single
-;; binding namespace (Phase 2); shadow's :node-* targets leave npm requires external.
+;; binding namespace; shadow's :node-* targets leave npm requires external.
 {:source-paths ["src" "test" "dev"]
  :dependencies [[funcool/promesa "12.0.1"]]
  :builds
@@ -26,7 +26,7 @@
         :output-to "target/dev.js"
         :devtools {:enabled true}}
 
-  ;; Phase 4 live smoke: a REAL on-disk classic-level database in a fresh directory
+  ;; Live smoke: a REAL on-disk classic-level database in a fresh directory
   ;; under the OS temp dir (removed afterwards) next to a memory-level one. No network.
   ;;   npx shadow-cljs compile smoke && node target/smoke.js
   :smoke {:target :node-script

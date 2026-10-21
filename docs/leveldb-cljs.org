@@ -1,6 +1,5 @@
 #+TITLE: leveldb-cljs Manual
 #+SUBTITLE: A ClojureScript (Node.js) client for LevelDB through =level= (classic-level / abstract-level 3) — codecs, batches, sublevels, core.async iterators and events
-#+DATE: 2026-09-25
 #+OPTIONS: toc:2 num:t ^:nil
 #+LANGUAGE: en
 
@@ -83,8 +82,8 @@ ordinary ClojureScript:
 - =leveldb-cljs.iter= — core.async over the iterator handles of =core=: no interop, no
   upstream objects.
 
-Where this manual says "verified live" it refers to the phase-4 live smoke
-(=dev/leveldb_cljs/smoke.cljs=, 8/8 sections passing on 2026-09-25 against a real
+Where this manual says "verified live" it refers to the live smoke
+(=dev/leveldb_cljs/smoke.cljs=, 8/8 sections against a real
 =classic-level= database in a temp directory on Linux x64 / Node 22.23.2 with the shipped
 prebuilt binary) and to the inventory's probes of the same day. The raw research behind
 the library — every upstream method, event, error code and pitfall with its evidence — is
@@ -830,8 +829,7 @@ through untouched (any =ex-info= is left as is; only JS errors are wrapped).
   reader (no =#=()= evaluation, inventory 9.12), which reads the *first* form and ignores
   trailing text: ="{:a 1} junk"= decodes to ={:a 1}=. That is the reader's documented
   contract and it is faster than validating the remainder; an empty string is a
-  =codec-error= (the reader would otherwise return nil and masquerade as "absent" — a
-  correction recorded in the Phase 2 inventory notes). EDN is the recommended value codec
+  =codec-error= (the reader would otherwise return nil and masquerade as "absent"). EDN is the recommended value codec
   for ClojureScript data because it is exact; =:json= exists for interop with other
   readers of the same database.
 - *Codec discipline.* Keys, values and bounds are encoded *before* upstream sees them and
@@ -907,7 +905,7 @@ npx shadow-cljs compile smoke && node target/smoke.js # LIVE smoke: a real on-di
 
 ** The live smoke
 
-=dev/leveldb_cljs/smoke.cljs= is the phase-4 live verification: a real =classic-level=
+=dev/leveldb_cljs/smoke.cljs= is the live verification: a real =classic-level=
 database in a fresh directory under the OS temp dir (=os.tmpdir= + =mkdtemp=, removed in
 every case), opened side by side with a =memory-level= one and driven only through the
 public API. The filesystem is the live part; nothing touches the network. It is not part
@@ -928,7 +926,7 @@ passed.
 | 6 | events                                                   | =:put= =:del= =:batch= =:clear= in order on the on-disk database; closing the channel releases the listeners (=:subscriptions= 1 ⇒ 0) |
 | 7 | codec edges                                              | the silent-stringify guard on a =:utf8= map value and map key, nil value ⇒ =argument-error=, missing key ⇒ nil for =get!= and =get-sync=, bad hex ⇒ =codec-error=, unknown codec and a camelCase option key ⇒ =argument-error= |
 
-The reference run of 2026-09-25 passed 8/8 on Linux x64, Node 22.23.2, =level= 10.0.0 /
+The smoke covers eight sections and supports Linux x64, Node 22.23.2, =level= 10.0.0 /
 =classic-level= 3.0.0 with the shipped =linux-x64= prebuild (=classic-level.node= +
 =classic-level.musl.node=, no local =build/= directory).
 
@@ -937,8 +935,7 @@ The reference run of 2026-09-25 passed 8/8 on Linux x64, Node 22.23.2, =level= 1
 One row per public function or constant: name, arguments, one line. I/O functions take
 the client (or handle) first and return a promesa promise; the synchronous ones are
 marked *sync* (they return a value and throw); pure helpers (no I/O, no upstream objects)
-are marked *pure*. Every name below exists in =src/= (checked by script when this manual
-was written).
+are marked *pure*. Every name below exists in =src/= .
 
 ** =leveldb-cljs.core=
 

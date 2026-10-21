@@ -1,5 +1,5 @@
 (ns leveldb-cljs.smoke
-  "Phase 4 LIVE smoke: a real on-disk `level` (classic-level) database in a
+  "Live smoke: a real on-disk `level` (classic-level) database in a
    fresh directory under the OS temp dir, opened side by side with a
    memory-level one, driven through the public API only. The filesystem is
    the live part: nothing here touches the network. Not part of

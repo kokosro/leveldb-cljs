@@ -1,5 +1,5 @@
 (ns leveldb-cljs.events-test
-  "Phase 4: the events! channel (inventory §6) on memory-level and on a
+  "The events! channel (inventory §6) on memory-level and on a
    temporary on-disk database. Network-free."
   (:require [cljs.core.async :as async :refer [<! go-loop]]
             [cljs.test :refer [deftest is async]]
